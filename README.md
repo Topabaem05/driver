@@ -119,3 +119,27 @@ The following gains for the PID and Feed-Forward controller are defined at the t
 - `K_FF_CURVATURE`: Feed-forward gain for lane curvature. Allows the car to anticipate turns based on detected road curvature.
 
 Tuning these values is an iterative process. It's often recommended to tune P gains first, then D, then I, and finally the FF gain. Other parameters like ROI ratios, color thresholds, and perspective transform points (`SRC_POINTS_ROI_RATIOS`) also significantly impact performance and may need adjustment.
+
+### Adjusting Forward Detection Range in Bird's-Eye View
+
+If the `warped_mask` (bird's-eye view of detected lanes) appears to cover too short or too long a distance in front of the vehicle, you can adjust the following global constants at the top of the `sam_lane_keeping_xycar.py` script:
+
+-   **`ROI_Y_START_PERCENTAGE`**:
+    -   Controls how far down from the top of the *resized camera image* the Region of Interest (ROI) begins.
+    -   **To see further ahead:** Decrease this value (e.g., from `0.45` to `0.35`). This makes the ROI start higher up in the camera view.
+    -   **To focus closer:** Increase this value.
+    -   Ensure the ROI still captures relevant road sections.
+
+-   **`SRC_POINTS_ROI_RATIOS`** (Y-coordinates of the top points):
+    -   These define the top edge of the trapezoid on the *ROI image* that is warped into a rectangle. The Y-coordinates are ratios of the ROI's height (0.0 is ROI top, 1.0 is ROI bottom).
+    -   Example: `[0.40, 0.05]` (Top-Left). The `0.05` is the Y-ratio.
+    -   **To see further ahead within the current ROI:** Decrease these top Y-ratio values (e.g., from `0.05` to `0.0` or `0.02`). This pushes the top edge of the source trapezoid higher within the ROI.
+    -   **To focus the warp on nearer parts of the ROI:** Increase these top Y-ratio values.
+
+-   **`WARPED_IMAGE_HEIGHT_AS_ROI_RATIO`**:
+    -   Determines the height of the output bird's-eye view image relative to the height of the input ROI.
+    -   **To stretch the view further / increase perceived range:** Increase this ratio (e.g., from `2.5` to `3.0` or `3.5`). This gives more pixels to represent the road further away in the warped image.
+    -   **To make the warped view more compact vertically:** Decrease this ratio.
+
+**Tuning Process:**
+Adjust these parameters iteratively. Modifying `ROI_Y_START_PERCENTAGE` changes what part of the scene is processed. Modifying `SRC_POINTS_ROI_RATIOS` (top Y) changes which part of that ROI is considered "far away". Modifying `WARPED_IMAGE_HEIGHT_AS_ROI_RATIO` changes how that "far away" part is stretched or compressed in the bird's-eye view. Observe the "Warped Mask" and "Final Visualization" windows to see the effect of your changes.

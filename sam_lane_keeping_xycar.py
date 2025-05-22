@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import rospy
@@ -6,365 +6,490 @@ import numpy as np
 import cv2
 import time
 from sensor_msgs.msg import Image
-from xycar_msgs.msg import XycarMotor
+from xycar_msgs.msg import XycarMotor  # User-confirmed import
 from cv_bridge import CvBridge
 
-# Global variables for ROS
+# --- Global Variables for ROS ---
 bridge = CvBridge()
-current_image = None
-motor_publisher = None
+current_image_cv = None  # Stores the latest image from the camera in OpenCV format
+motor_control_publisher = None # Publishes motor commands
 
-# Global variables for lane detection state
-previous_left_fit = None
-previous_right_fit = None
-prev_vehicle_offset_m_for_D = 0.0 # For D term of PID
-last_time_for_D = 0.0             # For D term of PID
-integral_vehicle_offset_m = 0.0   # For I term of PID
+# --- Global State Variables for Lane Detection ---
+previous_left_polynomial_fit = None  # Stores coefficients of the left lane polynomial from the previous frame
+previous_right_polynomial_fit = None # Stores coefficients of the right lane polynomial from the previous frame
+previous_vehicle_offset_meters = 0.0 # Stores the vehicle's offset from the previous frame, for D-term calculation
+last_time_for_derivative_calc = 0.0  # Stores the timestamp of the last D-term calculation
+accumulated_integral_offset_meters = 0.0 # Stores the accumulated offset for the I-term
 
+# --- Configuration Constants ---
+
+# Image Processing
+ROI_Y_START_PERCENTAGE = 0.55  # Pixels from top of RESIZED image to start ROI. Decrease to see further ahead in ROI.
+ROI_Y_END_PERCENTAGE = 0.95    # End ROI at 95% of image height from the top
+IMAGE_RESIZED_WIDTH = 320      # Width for image resizing
+IMAGE_RESIZED_HEIGHT = 240     # Height for image resizing
+
+# HLS Color Thresholds (example values, may need tuning)
+H_THRESHOLD_YELLOW_LANE = (15, 35)    # Hue range for detecting yellow lanes
+L_THRESHOLD_UNIVERSAL_LANE = (30, 200) # Lightness range for general lane visibility
+S_THRESHOLD_WHITE_YELLOW_LANE = (100, 255) # Saturation range for white/yellow lanes
+
+# Perspective Transform: Source points (relative to ROI of resized image)
+# These define a trapezoid. Order: Top-Left, Top-Right, Bottom-Right, Bottom-Left.
+# MUST BE TUNED for the specific camera setup.
+SRC_POINTS_ROI_RATIOS = np.float32([
+    [0.40, 0.05],  # Top-left. Y-coord (0.05) is % of ROI height from ROI top. Smaller Y = further view.
+    [0.60, 0.05],  # Top-right. Y-coord (0.05) is % of ROI height from ROI top. Smaller Y = further view.
+    [0.95, 0.90],  # Bottom-right
+    [0.05, 0.90]   # Bottom-left
+])
+
+# Perspective Transform: Destination Parameters
+WARPED_IMAGE_WIDTH_AS_ROI_RATIO = 1.0  # Warped image width as a ratio of the ROI width
+WARPED_IMAGE_HEIGHT_AS_ROI_RATIO = 2.5 # Ratio of warped image height to ROI height. Larger stretches view further.
+
+# Sliding Window Algorithm Parameters
+SLIDING_WINDOW_COUNT = 10
+SLIDING_WINDOW_MARGIN_PERCENTAGE = 0.15 # Window margin as percentage of the warped image width
+MIN_PIXELS_FOR_RECENTERING = 50
+
+# Polynomial Search Margin (when using a previous fit)
+POLYNOMIAL_SEARCH_MARGIN_PERCENTAGE = 0.10 # Margin as percentage of the warped image width
+
+# Pixel-to-Meter Conversion Factors (Example values, MUST BE TUNED based on camera calibration and warped image dimensions)
+# These are critical for converting pixel measurements to real-world distances for curvature and offset.
+YM_PER_PIX_WARPED = 30.0 / 720.0  # Example: 30 meters visible vertically maps to 720 pixels in warped image height
+XM_PER_PIX_WARPED = 3.7 / 700.0   # Example: Standard 3.7m lane width maps to 700 pixels in warped image width
+
+# PID and Feed-Forward Controller Gains (CRITICAL: NEEDS EXTENSIVE TUNING)
 # =====================================================================================
-# PID and Feed-Forward Gains (NEEDS EXTENSIVE TUNING!)
 # These are initial placeholder values and WILL require significant tuning 
 # based on the specific vehicle dynamics (e.g., Xycar in Unity simulator or real hardware) 
 # and the characteristics of the track / environment.
 # =====================================================================================
-KP_OFFSET = 30.0      # Proportional gain for vehicle offset (center_diff)
-KI_OFFSET = 2.0       # Integral gain for vehicle offset
-KD_OFFSET = 10.0      # Derivative gain for vehicle offset
-KP_HEADING = 25.0     # Proportional gain for heading error (e_psi)
-K_FF_CURVATURE = 0.8  # Feed-forward gain for lane curvature (based on Am of centerline)
+KP_LATERAL_OFFSET = 30.0      # Proportional gain for vehicle's lateral offset from lane center
+KI_LATERAL_OFFSET = 2.0       # Integral gain for lateral offset (helps eliminate steady-state error)
+KD_LATERAL_OFFSET = 10.0      # Derivative gain for lateral offset (helps dampen oscillations)
+KP_HEADING_ERROR = 25.0       # Proportional gain for heading error (angle between car and lane)
+K_FF_LANE_CURVATURE = 0.8     # Feed-forward gain for lane curvature (uses Am coefficient of centerline polynomial)
+MAX_INTEGRAL_TERM_VALUE = 0.5 # Anti-windup limit for the integral term of offset
+
+# Steering and Speed Limits
+MAX_STEERING_ANGLE_DEGREES = 35.0 # Max steering angle for Xycar (degrees)
+MAX_SPEED = 90.0
+MIN_SPEED_CURVE = 40.0
+MIN_SPEED_ANGLE = 50.0
 
 
-# Constants for image processing and lane detection
-ROI_Y_START_RATIO = 0.55
-ROI_Y_END_RATIO = 0.95
-RESIZED_WIDTH = 320
-RESIZED_HEIGHT = 240
-H_THRESH_YELLOW = (15, 35)
-L_THRESH_UNIVERSAL = (30, 200)
-S_THRESH_WHITE_YELLOW = (100, 255)
-SRC_POINTS_ROI_RATIOS = np.float32([
-    [0.40, 0.10], [0.60, 0.10],
-    [0.95, 0.90], [0.05, 0.90]
-])
-WARPED_WIDTH_RATIO = 1.0
-WARPED_HEIGHT_RATIO = 1.5
-N_WINDOWS = 10
-WINDOW_MARGIN_PERCENT = 0.15
-MIN_PIXELS_RECENTER = 50
-POLY_SEARCH_MARGIN_PERCENT = 0.10
-YM_PER_PIX = 30.0 / 720.0 
-XM_PER_PIX = 3.7 / 700.0
+def calculate_vehicle_heading_error(left_lane_fitx_px, right_lane_fitx_px, y_points_px, warped_image_height_px, ym_per_pix, xm_per_pix):
+    if left_lane_fitx_px is None or right_lane_fitx_px is None or \
+       left_lane_fitx_px.size == 0 or right_lane_fitx_px.size == 0 or y_points_px.size == 0:
+        return 0.0, 0.0  # No lines or data, no heading error or curvature factor
 
-def calculate_heading_error(left_fitx_px, right_fitx_px, ploty_px, H_warped_px, current_ym_per_pix, current_xm_per_pix):
-    if left_fitx_px is None or right_fitx_px is None or left_fitx_px.size == 0 or right_fitx_px.size == 0 or ploty_px.size == 0:
-        return 0.0, 0.0 
-    center_x_px = (left_fitx_px + right_fitx_px) / 2.0
+    center_lane_x_px = (left_lane_fitx_px + right_lane_fitx_px) / 2.0
+
     try:
-        center_fit_coeffs_m = np.polyfit(ploty_px * current_ym_per_pix, center_x_px * current_xm_per_pix, 2)
+        center_lane_coeffs_meters = np.polyfit(y_points_px * ym_per_pix, center_lane_x_px * xm_per_pix, 2)
     except (np.linalg.LinAlgError, TypeError, ValueError) as e:
         rospy.logwarn_throttle(1.0, f"Polyfit failed for heading error calculation: {e}")
         return 0.0, 0.0
-    y_eval_m = H_warped_px * current_ym_per_pix
-    tangent_val = 2 * center_fit_coeffs_m[0] * y_eval_m + center_fit_coeffs_m[1]
-    heading_error_rad = np.arctan(tangent_val)
-    signed_curvature_factor = center_fit_coeffs_m[0] if len(center_fit_coeffs_m) > 0 else 0.0
-    return heading_error_rad, signed_curvature_factor
+
+    # Evaluate derivative at the bottom of the image (closest point to the car in warped view)
+    y_eval_meters = warped_image_height_px * ym_per_pix
     
-def preprocess_image(bgr_image):
-    resized_bgr = cv2.resize(bgr_image, (RESIZED_WIDTH, RESIZED_HEIGHT), interpolation=cv2.INTER_AREA)
-    roi_y_start = int(RESIZED_HEIGHT * ROI_Y_START_RATIO)
-    roi_y_end = int(RESIZED_HEIGHT * ROI_Y_END_RATIO)
-    roi_x_start = 0
-    roi_x_end = RESIZED_WIDTH
-    roi_bgr = resized_bgr[roi_y_start:roi_y_end, roi_x_start:roi_x_end]
+    # Derivative dx/dy = 2*Am*y_m + Bm (where Am, Bm are coefficients in meter-space)
+    tangent_value = 2 * center_lane_coeffs_meters[0] * y_eval_meters + center_lane_coeffs_meters[1]
+    
+    heading_error_radians = np.arctan(tangent_value)
+    signed_curvature_factor_Am = center_lane_coeffs_meters[0] if len(center_lane_coeffs_meters) > 0 else 0.0
+    
+    return heading_error_radians, signed_curvature_factor_Am
+
+def preprocess_and_get_roi(bgr_image_input):
+    resized_bgr = cv2.resize(bgr_image_input, (IMAGE_RESIZED_WIDTH, IMAGE_RESIZED_HEIGHT), interpolation=cv2.INTER_AREA)
+    roi_y_start = int(IMAGE_RESIZED_HEIGHT * ROI_Y_START_PERCENTAGE)
+    roi_y_end = int(IMAGE_RESIZED_HEIGHT * ROI_Y_END_PERCENTAGE)
+    roi_bgr = resized_bgr[roi_y_start:roi_y_end, 0:IMAGE_RESIZED_WIDTH]
     return roi_bgr, resized_bgr
 
-def create_masks(roi_bgr):
-    hls_image = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2HLS)
+def generate_lane_masks(roi_bgr_image):
+    hls_image = cv2.cvtColor(roi_bgr_image, cv2.COLOR_BGR2HLS)
     h_channel, l_channel, s_channel = hls_image[:,:,0], hls_image[:,:,1], hls_image[:,:,2]
+
     yellow_mask = np.zeros_like(h_channel)
-    yellow_mask[(h_channel >= H_THRESH_YELLOW[0]) & (h_channel <= H_THRESH_YELLOW[1]) &
-                (l_channel >= L_THRESH_UNIVERSAL[0]) & (l_channel <= L_THRESH_UNIVERSAL[1]) &
-                (s_channel >= S_THRESH_WHITE_YELLOW[0]) & (s_channel <= S_THRESH_WHITE_YELLOW[1])] = 255
-    refined_white_mask = np.zeros_like(l_channel)
-    refined_white_mask[(l_channel >= 180) & (s_channel <= 60)] = 255
-    combined_mask = cv2.bitwise_or(yellow_mask, refined_white_mask)
-    return combined_mask, yellow_mask, refined_white_mask
+    yellow_mask[(h_channel >= H_THRESHOLD_YELLOW_LANE[0]) & (h_channel <= H_THRESHOLD_YELLOW_LANE[1]) &
+                (l_channel >= L_THRESHOLD_UNIVERSAL_LANE[0]) & (l_channel <= L_THRESHOLD_UNIVERSAL_LANE[1]) &
+                (s_channel >= S_THRESHOLD_WHITE_YELLOW_LANE[0]) & (s_channel <= S_THRESHOLD_WHITE_YELLOW_LANE[1])] = 255
+    
+    # Refined white mask: High Lightness, Low Saturation
+    white_mask = np.zeros_like(l_channel)
+    white_mask[(l_channel >= 180) & (s_channel <= 60)] = 255 # Example refinement for white
+    
+    combined_mask = cv2.bitwise_or(yellow_mask, white_mask)
+    return combined_mask, yellow_mask, white_mask # Return all for potential debugging
 
-def perspective_transform(img, src_points_ratios, dst_width_ratio, dst_height_ratio):
-    height, width = img.shape[:2]
-    src_points = np.float32([[width*r[0], height*r[1]] for r in src_points_ratios])
-    warped_width = int(width * dst_width_ratio)
-    warped_height = int(height * dst_height_ratio)
-    dst_points = np.float32([[0,0],[warped_width-1,0],[warped_width-1,warped_height-1],[0,warped_height-1]])
-    matrix = cv2.getPerspectiveTransform(src_points, dst_points)
-    inv_matrix = cv2.getPerspectiveTransform(dst_points, src_points)
-    warped_img = cv2.warpPerspective(img, matrix, (warped_width, warped_height), flags=cv2.INTER_LINEAR)
-    return warped_img, matrix, inv_matrix
+def calculate_perspective_transform(image_to_warp, src_roi_ratios, warped_width_roi_ratio, warped_height_roi_ratio):
+    img_height, img_width = image_to_warp.shape[:2]
+    
+    src_points_px = np.float32([[img_width * r[0], img_height * r[1]] for r in src_roi_ratios])
+    
+    output_warped_width = int(img_width * warped_width_roi_ratio)
+    output_warped_height = int(img_height * warped_height_roi_ratio)
+    
+    dst_points_px = np.float32([[0,0], [output_warped_width-1,0], 
+                                [output_warped_width-1,output_warped_height-1], [0,output_warped_height-1]])
+    
+    transform_matrix = cv2.getPerspectiveTransform(src_points_px, dst_points_px)
+    inverse_transform_matrix = cv2.getPerspectiveTransform(dst_points_px, src_points_px)
+    
+    warped_output_image = cv2.warpPerspective(image_to_warp, transform_matrix, 
+                                             (output_warped_width, output_warped_height), flags=cv2.INTER_LINEAR)
+    return warped_output_image, transform_matrix, inverse_transform_matrix
 
-def find_lane_starting_points(binary_warped):
-    histogram = np.sum(binary_warped[binary_warped.shape[0]//2:, :], axis=0)
+def get_lane_start_points_from_histogram(binary_warped_image):
+    histogram = np.sum(binary_warped_image[binary_warped_image.shape[0]//2:, :], axis=0)
     midpoint = np.int(histogram.shape[0]/2)
-    leftx_base = np.argmax(histogram[:midpoint]) if midpoint > 0 and np.any(histogram[:midpoint]) else 0
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint if midpoint < histogram.shape[0] and np.any(histogram[midpoint:]) else histogram.shape[0]-1
-    return leftx_base, rightx_base, histogram
+    left_base_x = np.argmax(histogram[:midpoint]) if midpoint > 0 and np.any(histogram[:midpoint]) else 0
+    right_base_x = np.argmax(histogram[midpoint:]) + midpoint if midpoint < histogram.shape[0] and np.any(histogram[midpoint:]) else histogram.shape[0]-1
+    return left_base_x, right_base_x
 
-def sliding_window_search(binary_warped, leftx_base, rightx_base):
-    out_img = np.dstack((binary_warped, binary_warped, binary_warped))
-    if np.max(binary_warped) <= 1 and binary_warped.ndim == 2: out_img *= 255 
-    out_img = out_img.astype(np.uint8)
-    nwindows = N_WINDOWS
-    window_height = np.int(binary_warped.shape[0]/nwindows)
-    margin = int(binary_warped.shape[1] * WINDOW_MARGIN_PERCENT)
-    minpix = MIN_PIXELS_RECENTER
-    nonzero = binary_warped.nonzero()
-    nonzeroy, nonzerox = np.array(nonzero[0]), np.array(nonzero[1])
-    leftx_current, rightx_current = leftx_base, rightx_base
-    left_lane_inds, right_lane_inds = [], []
-    for window in range(nwindows):
-        win_y_low, win_y_high = binary_warped.shape[0]-(window+1)*window_height, binary_warped.shape[0]-window*window_height
-        win_xleft_low, win_xleft_high = leftx_current-margin, leftx_current+margin
-        win_xright_low, win_xright_high = rightx_current-margin, rightx_current+margin
-        cv2.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),(0,255,0),2) 
-        cv2.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high),(0,255,0),2) 
-        good_left_inds = ((nonzeroy>=win_y_low)&(nonzeroy<win_y_high)&(nonzerox>=win_xleft_low)&(nonzerox<win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy>=win_y_low)&(nonzeroy<win_y_high)&(nonzerox>=win_xright_low)&(nonzerox<win_xright_high)).nonzero()[0]
-        left_lane_inds.append(good_left_inds); right_lane_inds.append(good_right_inds)
-        if len(good_left_inds)>minpix: leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds)>minpix: rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
-    left_lane_inds = np.concatenate(left_lane_inds) if len(left_lane_inds)>0 and any(i.size > 0 for i in left_lane_inds) else np.array([], dtype=np.int32)
-    right_lane_inds = np.concatenate(right_lane_inds) if len(right_lane_inds)>0 and any(i.size > 0 for i in right_lane_inds) else np.array([], dtype=np.int32)
-    leftx = nonzerox[left_lane_inds] if left_lane_inds.size > 0 else np.array([])
-    lefty = nonzeroy[left_lane_inds] if left_lane_inds.size > 0 else np.array([])
-    rightx = nonzerox[right_lane_inds] if right_lane_inds.size > 0 else np.array([])
-    righty = nonzeroy[right_lane_inds] if right_lane_inds.size > 0 else np.array([])
-    if len(leftx)>0: out_img[lefty,leftx] = [255,0,0]
-    if len(rightx)>0: out_img[righty,rightx] = [0,0,255]
-    return leftx,lefty,rightx,righty,out_img
+def perform_sliding_window_search(binary_warped_image, initial_leftx_base, initial_rightx_base):
+    output_visualization_img = np.dstack((binary_warped_image, binary_warped_image, binary_warped_image))
+    if np.max(binary_warped_image) <= 1 and binary_warped_image.ndim == 2: output_visualization_img *= 255 
+    output_visualization_img = output_visualization_img.astype(np.uint8)
 
-def search_around_previous_fit(binary_warped, left_fit, right_fit):
-    margin = int(binary_warped.shape[1] * POLY_SEARCH_MARGIN_PERCENT)
-    nonzero = binary_warped.nonzero()
-    nonzeroy, nonzerox = np.array(nonzero[0]), np.array(nonzero[1])
-    out_img = np.dstack((binary_warped,binary_warped,binary_warped))
-    if np.max(binary_warped) <= 1 and binary_warped.ndim == 2: out_img *= 255
-    out_img = out_img.astype(np.uint8)
-    left_lane_inds_bool = ((nonzerox > (left_fit[0]*(nonzeroy**2)+left_fit[1]*nonzeroy+left_fit[2]-margin)) & 
-                           (nonzerox < (left_fit[0]*(nonzeroy**2)+left_fit[1]*nonzeroy+left_fit[2]+margin))) 
-    right_lane_inds_bool = ((nonzerox > (right_fit[0]*(nonzeroy**2)+right_fit[1]*nonzeroy+right_fit[2]-margin)) & 
-                            (nonzerox < (right_fit[0]*(nonzeroy**2)+right_fit[1]*nonzeroy+right_fit[2]+margin)))
-    left_lane_inds = left_lane_inds_bool.nonzero()[0]
-    right_lane_inds = right_lane_inds_bool.nonzero()[0]
-    leftx, lefty = nonzerox[left_lane_inds], nonzeroy[left_lane_inds]
-    rightx, righty = nonzerox[right_lane_inds], nonzeroy[right_lane_inds]
-    if len(leftx)>0: out_img[lefty,leftx] = [255,0,0]
-    if len(rightx)>0: out_img[righty,rightx] = [0,0,255]
-    return leftx,lefty,rightx,righty,out_img
+    window_height = np.int(binary_warped_image.shape[0] / SLIDING_WINDOW_COUNT)
+    margin_px = int(binary_warped_image.shape[1] * SLIDING_WINDOW_MARGIN_PERCENTAGE)
+    
+    nonzero_pixels = binary_warped_image.nonzero()
+    nonzeroy_coords, nonzerox_coords = np.array(nonzero_pixels[0]), np.array(nonzero_pixels[1])
+    
+    current_leftx, current_rightx = initial_leftx_base, initial_rightx_base
+    left_lane_pixel_indices, right_lane_pixel_indices = [], []
 
-def fit_polynomial(leftx, lefty, rightx, righty, warped_height):
-    global previous_left_fit, previous_right_fit
-    left_fit, right_fit = None, None
-    if len(leftx)>0 and len(lefty)>0:
-        try: left_fit = np.polyfit(lefty,leftx,2)
-        except (np.RankWarning, Exception) as e: rospy.logwarn_throttle(1.0,f"LFitFail:{e}"); left_fit=previous_left_fit
-    else: left_fit=previous_left_fit
-    if len(rightx)>0 and len(righty)>0:
-        try: right_fit = np.polyfit(righty,rightx,2)
-        except (np.RankWarning, Exception) as e: rospy.logwarn_throttle(1.0,f"RFitFail:{e}"); right_fit=previous_right_fit
-    else: right_fit=previous_right_fit
-    ploty = np.linspace(0,warped_height-1,warped_height)
-    left_fitx, right_fitx = np.array([]), np.array([])
-    if left_fit is not None:
-        left_fitx = left_fit[0]*ploty**2+left_fit[1]*ploty+left_fit[2]
-        previous_left_fit = left_fit
-    if right_fit is not None:
-        right_fitx = right_fit[0]*ploty**2+right_fit[1]*ploty+right_fit[2]
-        previous_right_fit = right_fit
-    return left_fit,right_fit,left_fitx,right_fitx,ploty
-
-def calculate_curvature_offset(left_fitx, right_fitx, ploty, warped_dims):
-    warped_height, warped_width = warped_dims
-    y_eval = np.max(ploty) if ploty.size > 0 else warped_height -1
-    left_curverad, right_curverad = float('inf'), float('inf')
-    if len(left_fitx)>0 and len(ploty)>0:
-        left_fit_cr = np.polyfit(ploty*YM_PER_PIX,left_fitx*XM_PER_PIX,2)
-        if abs(left_fit_cr[0]) > 1e-9 : left_curverad = ((1+(2*left_fit_cr[0]*y_eval*YM_PER_PIX+left_fit_cr[1])**2)**1.5)/np.absolute(2*left_fit_cr[0])
-    if len(right_fitx)>0 and len(ploty)>0:
-        right_fit_cr = np.polyfit(ploty*YM_PER_PIX,right_fitx*XM_PER_PIX,2)
-        if abs(right_fit_cr[0]) > 1e-9 : right_curverad = ((1+(2*right_fit_cr[0]*y_eval*YM_PER_PIX+right_fit_cr[1])**2)**1.5)/np.absolute(2*right_fit_cr[0])
-    lane_center_px = (left_fitx[-1]+right_fitx[-1])/2 if len(left_fitx)>0 and len(right_fitx)>0 else warped_width/2
-    car_center_px = warped_width/2
-    offset_m = (car_center_px-lane_center_px)*XM_PER_PIX
-    return left_curverad,right_curverad,offset_m
-
-def visualize_lanes(original_img, warped_binary_shape, inv_matrix, left_fitx, right_fitx, ploty, 
-                    left_cur, right_cur, offset, final_steering_angle):
-    final_image = original_img.copy()
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    font_scale = 0.6
-    font_color = (255,255,255)
-    line_type = 2
-    text_y_start = 30
-    text_y_offset = 25
-
-    if left_fitx.size==0 or right_fitx.size==0 or ploty.size==0:
-        avg_cur_display = (left_cur + right_cur) / 2.0 if left_cur!=float('inf') and right_cur!=float('inf') else (left_cur if left_cur!=float('inf') else right_cur)
-        cv2.putText(final_image,f"Curvature: {avg_cur_display:.0f}m" if avg_cur_display!=float('inf') else "Curvature: Straight",(10,text_y_start),font,font_scale,(0,0,0),line_type)
-        cv2.putText(final_image,f"Offset:{offset:.2f}m(NoLines)",(10,text_y_start+text_y_offset),font,font_scale,(0,0,0),line_type)
-        cv2.putText(final_image,f"Steer Angle:{final_steering_angle:.1f}deg",(10,text_y_start+2*text_y_offset),font,font_scale,(0,0,0),line_type)
-        return final_image
+    for window_idx in range(SLIDING_WINDOW_COUNT):
+        win_y_low = binary_warped_image.shape[0] - (window_idx + 1) * window_height
+        win_y_high = binary_warped_image.shape[0] - window_idx * window_height
+        win_xleft_low, win_xleft_high = current_leftx - margin_px, current_leftx + margin_px
+        win_xright_low, win_xright_high = current_rightx - margin_px, current_rightx + margin_px
         
-    warp_zero = np.zeros(warped_binary_shape,dtype=np.uint8)
-    color_warp = np.dstack((warp_zero,warp_zero,warp_zero))
-    pts_left = np.array([np.transpose(np.vstack([left_fitx,ploty]))])
-    pts_right_fill = np.array([np.flipud(np.transpose(np.vstack([right_fitx,ploty])))])
-    pts = np.hstack((pts_left,pts_right_fill))
-    cv2.fillPoly(color_warp,np.int_([pts]),(0,255,0))
-    cv2.polylines(color_warp,np.int_([pts_left]),isClosed=False,color=(255,0,0),thickness=10)
-    pts_right_line = np.array([np.transpose(np.vstack([right_fitx,ploty]))])
-    cv2.polylines(color_warp,np.int_([pts_right_line]),isClosed=False,color=(0,0,255),thickness=10)
-    
-    newwarp = cv2.warpPerspective(color_warp,inv_matrix,(original_img.shape[1],original_img.shape[0])) 
-    final_image = cv2.addWeighted(final_image,1,newwarp,0.3,0)
-    
-    avg_cur_display = (left_cur + right_cur) / 2.0 if left_cur!=float('inf') and right_cur!=float('inf') else (left_cur if left_cur!=float('inf') else right_cur)
-    cur_text = f"Curvature: {avg_cur_display:.0f}m" if avg_cur_display!=float('inf') else "Curvature: Straight"
-    cv2.putText(final_image,cur_text,(10,text_y_start),font,font_scale,font_color,line_type)
-    cv2.putText(final_image,f"Offset: {offset:.2f}m",(10,text_y_start+text_y_offset),font,font_scale,font_color,line_type)
-    cv2.putText(final_image,f"Steer Angle: {final_steering_angle:.1f} deg",(10,text_y_start+2*text_y_offset),font,font_scale,font_color,line_type)
-    return final_image
+        cv2.rectangle(output_visualization_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0,255,0), 2) 
+        cv2.rectangle(output_visualization_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0,255,0), 2) 
+        
+        good_left_indices = ((nonzeroy_coords >= win_y_low) & (nonzeroy_coords < win_y_high) & 
+                             (nonzerox_coords >= win_xleft_low) & (nonzerox_coords < win_xleft_high)).nonzero()[0]
+        good_right_indices = ((nonzeroy_coords >= win_y_low) & (nonzeroy_coords < win_y_high) & 
+                              (nonzerox_coords >= win_xright_low) & (nonzerox_coords < win_xright_high)).nonzero()[0]
+        
+        left_lane_pixel_indices.append(good_left_indices)
+        right_lane_pixel_indices.append(good_right_indices)
+        
+        if len(good_left_indices) > MIN_PIXELS_FOR_RECENTERING: current_leftx = np.int(np.mean(nonzerox_coords[good_left_indices]))
+        if len(good_right_indices) > MIN_PIXELS_FOR_RECENTERING: current_rightx = np.int(np.mean(nonzerox_coords[good_right_indices]))
 
-def process_image(image_input):
-    global previous_left_fit, previous_right_fit, prev_vehicle_offset_m_for_D, last_time_for_D, integral_vehicle_offset_m
-    roi_bgr, resized_bgr_for_display = preprocess_image(image_input)
-    combined_mask, yellow_mask, white_mask = create_masks(roi_bgr)
-    warped_mask, pers_matrix, inv_pers_matrix = perspective_transform(combined_mask, SRC_POINTS_ROI_RATIOS, WARPED_WIDTH_RATIO, WARPED_HEIGHT_RATIO)
-    warped_dims = (warped_mask.shape[0], warped_mask.shape[1])
-    if previous_left_fit is not None and previous_right_fit is not None:
-        leftx,lefty,rightx,righty,lane_search_viz = search_around_previous_fit(warped_mask,previous_left_fit,previous_right_fit)
-        if len(leftx)<MIN_PIXELS_RECENTER or len(rightx)<MIN_PIXELS_RECENTER:
-            rospy.logwarn_throttle(1.0,"SearchPolyFail->SlideWin")
-            left_base,right_base,_ = find_lane_starting_points(warped_mask)
-            leftx,lefty,rightx,righty,lane_search_viz = sliding_window_search(warped_mask,left_base,right_base)
-    else:
-        left_base,right_base,_ = find_lane_starting_points(warped_mask)
-        leftx,lefty,rightx,righty,lane_search_viz = sliding_window_search(warped_mask,left_base,right_base)
-    left_fit,right_fit,left_fitx,right_fitx,ploty = fit_polynomial(leftx,lefty,rightx,righty,warped_dims[0])
-    center_diff = 0.0; left_cur,right_cur = float('inf'),float('inf')
-    if left_fit is not None and right_fit is not None and len(left_fitx)>0 and len(right_fitx)>0:
-        left_cur,right_cur,center_diff = calculate_curvature_offset(left_fitx,right_fitx,ploty,warped_dims)
-    else: rospy.logwarn_throttle(1.0,"BadPolyFit->DefaultCurv/Offset")
-    heading_error_rad,signed_curvature_factor = 0.0,0.0
-    if left_fit is not None and right_fit is not None and all(f is not None for f in [left_fitx,right_fitx,ploty]) and all(f.size>0 for f in [left_fitx,right_fitx,ploty]):
-        heading_error_rad,signed_curvature_factor = calculate_heading_error(left_fitx,right_fitx,ploty,warped_dims[0],YM_PER_PIX,XM_PER_PIX)
-    else: rospy.logwarn_throttle(1.0,"SkipHeadingErr->MissingFits")
+    left_lane_pixel_indices = np.concatenate(left_lane_pixel_indices) if len(left_lane_pixel_indices) > 0 and any(i.size > 0 for i in left_lane_pixel_indices) else np.array([], dtype=np.int32)
+    right_lane_pixel_indices = np.concatenate(right_lane_pixel_indices) if len(right_lane_pixel_indices) > 0 and any(i.size > 0 for i in right_lane_pixel_indices) else np.array([], dtype=np.int32)
     
-    current_time = rospy.get_time(); dt=0.0
-    if last_time_for_D>0: dt = current_time-last_time_for_D
+    final_leftx, final_lefty = nonzerox_coords[left_lane_pixel_indices] if left_lane_pixel_indices.size > 0 else np.array([]), nonzeroy_coords[left_lane_pixel_indices] if left_lane_pixel_indices.size > 0 else np.array([])
+    final_rightx, final_righty = nonzerox_coords[right_lane_pixel_indices] if right_lane_pixel_indices.size > 0 else np.array([]), nonzeroy_coords[right_lane_pixel_indices] if right_lane_pixel_indices.size > 0 else np.array([])
     
-    d_offset_dt = (center_diff-prev_vehicle_offset_m_for_D)/dt if dt>0.001 else 0.0
+    if len(final_leftx) > 0: output_visualization_img[final_lefty, final_leftx] = [255,0,0] # Blue
+    if len(final_rightx) > 0: output_visualization_img[final_righty, final_rightx] = [0,0,255] # Red
     
-    if dt > 0: integral_vehicle_offset_m += center_diff * dt
-    max_integral_val = 0.5 
-    integral_vehicle_offset_m = np.clip(integral_vehicle_offset_m, -max_integral_val, max_integral_val)
-    i_offset_term = KI_OFFSET * integral_vehicle_offset_m
+    return final_leftx, final_lefty, final_rightx, final_righty, output_visualization_img
 
-    prev_vehicle_offset_m_for_D,last_time_for_D = center_diff,current_time
-    p_offset_term = KP_OFFSET*center_diff
-    d_offset_term = KD_OFFSET*d_offset_dt
-    p_heading_term = KP_HEADING*heading_error_rad
-    ff_curvature_term = K_FF_CURVATURE*signed_curvature_factor
-    target_angle_rad = p_offset_term + i_offset_term + d_offset_term - p_heading_term - ff_curvature_term
-    angle_deg = np.degrees(target_angle_rad)
-    angle = np.clip(angle_deg,-35.0,35.0) # Changed from -50,50
+def search_lane_pixels_around_poly(binary_warped_image, polyfit_left, polyfit_right):
+    margin_px = int(binary_warped_image.shape[1] * POLYNOMIAL_SEARCH_MARGIN_PERCENTAGE)
+    nonzero_pixels = binary_warped_image.nonzero()
+    nonzeroy_coords, nonzerox_coords = np.array(nonzero_pixels[0]), np.array(nonzero_pixels[1])
     
-    avg_curvature = float('inf')
-    if left_cur != float('inf') and right_cur != float('inf'): avg_curvature = (left_cur + right_cur) / 2.0
-    elif left_cur != float('inf'): avg_curvature = left_cur
-    elif right_cur != float('inf'): avg_curvature = right_cur
+    output_visualization_img = np.dstack((binary_warped_image, binary_warped_image, binary_warped_image))
+    if np.max(binary_warped_image) <= 1 and binary_warped_image.ndim == 2: output_visualization_img *= 255
+    output_visualization_img = output_visualization_img.astype(np.uint8)
 
-    base_speed_for_curve = 90.0
-    if avg_curvature < 150: base_speed_for_curve = 40.0
-    elif avg_curvature < 400: base_speed_for_curve = 55.0
-    elif avg_curvature < 800: base_speed_for_curve = 70.0
+    left_poly_line_x = polyfit_left[0]*(nonzeroy_coords**2) + polyfit_left[1]*nonzeroy_coords + polyfit_left[2]
+    left_lane_indices_bool = ((nonzerox_coords > left_poly_line_x - margin_px) & (nonzerox_coords < left_poly_line_x + margin_px))
     
-    speed_due_to_angle = 90.0; abs_final_angle = abs(angle)
-    if abs_final_angle < 5: speed_due_to_angle = 90.0
-    elif abs_final_angle < 10: speed_due_to_angle = 80.0
-    elif abs_final_angle < 20: speed_due_to_angle = 70.0
-    else: speed_due_to_angle = 50.0
+    right_poly_line_x = polyfit_right[0]*(nonzeroy_coords**2) + polyfit_right[1]*nonzeroy_coords + polyfit_right[2]
+    right_lane_indices_bool = ((nonzerox_coords > right_poly_line_x - margin_px) & (nonzerox_coords < right_poly_line_x + margin_px))
+    
+    final_leftx, final_lefty = nonzerox_coords[left_lane_indices_bool], nonzeroy_coords[left_lane_indices_bool]
+    final_rightx, final_righty = nonzerox_coords[right_lane_indices_bool], nonzeroy_coords[right_lane_indices_bool]
+    
+    if len(final_leftx) > 0: output_visualization_img[final_lefty, final_leftx] = [255,0,0] # Blue
+    if len(final_rightx) > 0: output_visualization_img[final_righty, final_rightx] = [0,0,255] # Red
+        
+    return final_leftx, final_lefty, final_rightx, final_righty, output_visualization_img
+
+def apply_polynomial_fit(detected_leftx_px, detected_lefty_px, detected_rightx_px, detected_righty_px, warped_image_h_px):
+    global previous_left_polynomial_fit, previous_right_polynomial_fit
+    
+    current_left_fit, current_right_fit = None, None
+    
+    if len(detected_leftx_px) > 0 and len(detected_lefty_px) > 0:
+        try: current_left_fit = np.polyfit(detected_lefty_px, detected_leftx_px, 2)
+        except (np.RankWarning, Exception): current_left_fit = previous_left_polynomial_fit
+    else: current_left_fit = previous_left_polynomial_fit
+        
+    if len(detected_rightx_px) > 0 and len(detected_righty_px) > 0:
+        try: current_right_fit = np.polyfit(detected_righty_px, detected_rightx_px, 2)
+        except (np.RankWarning, Exception): current_right_fit = previous_right_polynomial_fit
+    else: current_right_fit = previous_right_polynomial_fit
+        
+    y_points_for_plotting = np.linspace(0, warped_image_h_px - 1, warped_image_h_px)
+    fitted_leftx_px, fitted_rightx_px = np.array([]), np.array([])
+    
+    if current_left_fit is not None:
+        fitted_leftx_px = current_left_fit[0]*y_points_for_plotting**2 + current_left_fit[1]*y_points_for_plotting + current_left_fit[2]
+        previous_left_polynomial_fit = current_left_fit
+    if current_right_fit is not None:
+        fitted_rightx_px = current_right_fit[0]*y_points_for_plotting**2 + current_right_fit[1]*y_points_for_plotting + current_right_fit[2]
+        previous_right_polynomial_fit = current_right_fit
+        
+    return current_left_fit, current_right_fit, fitted_leftx_px, fitted_rightx_px, y_points_for_plotting
+
+def get_curvature_and_offset(fitted_leftx_px, fitted_rightx_px, y_points_for_plotting, warped_image_dims_px):
+    warped_h_px, warped_w_px = warped_image_dims_px
+    y_eval_px = np.max(y_points_for_plotting) if y_points_for_plotting.size > 0 else warped_h_px - 1
+    
+    left_curvature_m, right_curvature_m = float('inf'), float('inf')
+    
+    if len(fitted_leftx_px) > 0 and len(y_points_for_plotting) > 0:
+        left_fit_coeffs_meters = np.polyfit(y_points_for_plotting * YM_PER_PIX_WARPED, fitted_leftx_px * XM_PER_PIX_WARPED, 2)
+        if abs(left_fit_coeffs_meters[0]) > 1e-9:
+            left_curvature_m = ((1 + (2*left_fit_coeffs_meters[0]*y_eval_px*YM_PER_PIX_WARPED + left_fit_coeffs_meters[1])**2)**1.5) / np.absolute(2*left_fit_coeffs_meters[0])
             
-    speed = min(base_speed_for_curve,speed_due_to_angle)
+    if len(fitted_rightx_px) > 0 and len(y_points_for_plotting) > 0:
+        right_fit_coeffs_meters = np.polyfit(y_points_for_plotting * YM_PER_PIX_WARPED, fitted_rightx_px * XM_PER_PIX_WARPED, 2)
+        if abs(right_fit_coeffs_meters[0]) > 1e-9:
+            right_curvature_m = ((1 + (2*right_fit_coeffs_meters[0]*y_eval_px*YM_PER_PIX_WARPED + right_fit_coeffs_meters[1])**2)**1.5) / np.absolute(2*right_fit_coeffs_meters[0])
+            
+    lane_center_px = (fitted_leftx_px[-1] + fitted_rightx_px[-1]) / 2 if len(fitted_leftx_px)>0 and len(fitted_rightx_px)>0 else warped_w_px / 2
+    vehicle_center_px = warped_w_px / 2
+    offset_meters = (vehicle_center_px - lane_center_px) * XM_PER_PIX_WARPED
+    
+    return left_curvature_m, right_curvature_m, offset_meters
 
-    final_visualization = resized_bgr_for_display 
-    if left_fit is not None and right_fit is not None and inv_pers_matrix is not None:
-         final_visualization = visualize_lanes(resized_bgr_for_display, warped_mask.shape, inv_pers_matrix, 
-                                               left_fitx, right_fitx, ploty, 
-                                               left_cur, right_cur, center_diff, angle)
-    else: 
-        final_visualization = resized_bgr_for_display.copy()
-        font = cv2.FONT_HERSHEY_SIMPLEX
-        font_scale = 0.6; line_type = 2; text_y_start = 30; text_y_offset = 25
-        cv2.putText(final_visualization, f"Curvature: {left_cur:.0f}m R:{right_cur:.0f}m (Warp/Fit Error)", 
-                    (10, text_y_start), font, font_scale, (0,0,255), line_type)
-        cv2.putText(final_visualization, f"Offset: {center_diff:.2f}m (Warp/Fit Error)", 
-                    (10, text_y_start + text_y_offset), font, font_scale, (0,0,255), line_type)
-        cv2.putText(final_visualization, f"Steer Angle: {angle:.1f} deg (Warp/Fit Error)", 
-                    (10, text_y_start + 2*text_y_offset), font, font_scale, (0,0,255), line_type)
+def draw_lane_visualization(original_bgr_image, warped_binary_image_shape, inv_perspective_matrix, 
+                            fitted_leftx_px, fitted_rightx_px, y_points_for_plotting, 
+                            left_curvature_m, right_curvature_m, vehicle_offset_m, final_steering_angle_deg):
+    output_image = original_bgr_image.copy()
+    font, font_scale, font_color, line_type = cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2
+    text_y_start, text_y_offset = 30, 25
 
-    debug_info = {"left_curvature":left_cur,"right_curvature":right_cur,"center_diff":center_diff,
-                  "heading_error_rad":heading_error_rad,"signed_curvature_factor":signed_curvature_factor,
-                  "pid_p_offset":p_offset_term,"pid_d_offset":d_offset_term, "integral_offset_val": integral_vehicle_offset_m, "pid_i_offset": i_offset_term,
-                  "pid_p_heading":p_heading_term,"ff_curvature":ff_curvature_term,"target_angle_rad":target_angle_rad,
-                  "final_angle_deg":angle,"avg_curvature":avg_curvature, "base_speed_for_curve":base_speed_for_curve,
-                  "speed_due_to_angle":speed_due_to_angle, "final_speed":speed}
-    return angle,speed,final_visualization,combined_mask,warped_mask,lane_search_viz,debug_info
+    if fitted_leftx_px.size==0 or fitted_rightx_px.size==0 or y_points_for_plotting.size==0:
+        avg_curvature = (left_curvature_m + right_curvature_m)/2 if left_curvature_m!=float('inf') and right_curvature_m!=float('inf') else (left_curvature_m if left_curvature_m!=float('inf') else right_curvature_m)
+        cv2.putText(output_image, f"Curv: {avg_curvature:.0f}m" if avg_curvature!=float('inf') else "Curv: Straight", (10,text_y_start), font,font_scale,(0,0,0),line_type)
+        cv2.putText(output_image, f"Offset:{vehicle_offset_m:.2f}m(NoLines)", (10,text_y_start+text_y_offset), font,font_scale,(0,0,0),line_type)
+        cv2.putText(output_image, f"Steer: {final_steering_angle_deg:.1f}deg", (10,text_y_start+2*text_y_offset), font,font_scale,(0,0,0),line_type)
+        return output_image
+        
+    warp_color_overlay = np.zeros(warped_binary_image_shape, dtype=np.uint8)
+    color_warp_rgb = np.dstack((warp_color_overlay, warp_color_overlay, warp_color_overlay))
+    
+    left_lane_points = np.array([np.transpose(np.vstack([fitted_leftx_px, y_points_for_plotting]))])
+    right_lane_points_for_fill = np.array([np.flipud(np.transpose(np.vstack([fitted_rightx_px, y_points_for_plotting])))])
+    lane_polygon_points = np.hstack((left_lane_points, right_lane_points_for_fill))
+    
+    cv2.fillPoly(color_warp_rgb, np.int_([lane_polygon_points]), (0,255,0)) # Green fill
+    cv2.polylines(color_warp_rgb, np.int_([left_lane_points]), isClosed=False, color=(255,0,0), thickness=10) # Blue left line
+    right_lane_points_for_line = np.array([np.transpose(np.vstack([fitted_rightx_px, y_points_for_plotting]))])
+    cv2.polylines(color_warp_rgb, np.int_([right_lane_points_for_line]), isClosed=False, color=(0,0,255), thickness=10) # Red right line
+    
+    unwarped_lane_overlay = cv2.warpPerspective(color_warp_rgb, inv_perspective_matrix, (original_bgr_image.shape[1], original_bgr_image.shape[0])) 
+    output_image = cv2.addWeighted(output_image, 1, unwarped_lane_overlay, 0.3, 0)
+    
+    avg_curvature = (left_curvature_m + right_curvature_m)/2 if left_curvature_m!=float('inf') and right_curvature_m!=float('inf') else (left_curvature_m if left_curvature_m!=float('inf') else right_curvature_m)
+    curvature_text = f"Curv: {avg_curvature:.0f}m" if avg_curvature!=float('inf') else "Curv: Straight"
+    cv2.putText(output_image, curvature_text, (10,text_y_start), font,font_scale,font_color,line_type)
+    cv2.putText(output_image, f"Offset: {vehicle_offset_m:.2f}m", (10,text_y_start+text_y_offset), font,font_scale,font_color,line_type)
+    cv2.putText(output_image, f"Steer Angle: {final_steering_angle_deg:.1f}deg", (10,text_y_start+2*text_y_offset), font,font_scale,font_color,line_type)
+    return output_image
 
-def image_callback(img_msg):
-    global current_image
-    current_image = bridge.imgmsg_to_cv2(img_msg,"bgr8")
+def main_image_processing_pipeline(cv_image):
+    global previous_left_polynomial_fit, previous_right_polynomial_fit, prev_vehicle_offset_m_for_D, last_time_for_derivative_calc, accumulated_integral_offset_meters
+    
+    roi_image_bgr, resized_original_bgr = preprocess_and_get_roi(cv_image)
+    combined_binary_mask, _, _ = generate_lane_masks(roi_image_bgr)
+    
+    warped_binary_mask, perspective_matrix, inverse_perspective_matrix = calculate_perspective_transform(
+        combined_binary_mask, PERSPECTIVE_SRC_POINTS_ROI_RATIOS, 
+        WARPED_IMAGE_WIDTH_AS_ROI_RATIO, WARPED_IMAGE_HEIGHT_AS_ROI_RATIO
+    )
+    warped_image_dimensions = (warped_binary_mask.shape[0], warped_binary_mask.shape[1]) # Height, Width
+    
+    if previous_left_polynomial_fit is not None and previous_right_polynomial_fit is not None:
+        detected_leftx, detected_lefty, detected_rightx, detected_righty, lane_search_visualization_img = \
+            search_lane_pixels_around_poly(warped_binary_mask, previous_left_polynomial_fit, previous_right_polynomial_fit)
+        if len(detected_leftx) < MIN_PIXELS_FOR_RECENTERING or len(detected_rightx) < MIN_PIXELS_FOR_RECENTERING:
+            rospy.logwarn_throttle(1.0,"SearchPolyFail->SlideWin")
+            initial_leftx_base, initial_rightx_base, _ = get_lane_start_points_from_histogram(warped_binary_mask)
+            detected_leftx, detected_lefty, detected_rightx, detected_righty, lane_search_visualization_img = \
+                perform_sliding_window_search(warped_binary_mask, initial_leftx_base, initial_rightx_base)
+    else:
+        initial_leftx_base, initial_rightx_base, _ = get_lane_start_points_from_histogram(warped_binary_mask)
+        detected_leftx, detected_lefty, detected_rightx, detected_righty, lane_search_visualization_img = \
+            perform_sliding_window_search(warped_binary_mask, initial_leftx_base, initial_rightx_base)
+            
+    current_left_fit_coeffs, current_right_fit_coeffs, fitted_leftx_plot, fitted_rightx_plot, y_points_plot = \
+        apply_polynomial_fit(detected_leftx, detected_lefty, detected_rightx, detected_righty, warped_image_dimensions[0])
+        
+    vehicle_offset_meters = 0.0; left_curvature_m, right_curvature_m = float('inf'), float('inf')
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and \
+       len(fitted_leftx_plot) > 0 and len(fitted_rightx_plot) > 0:
+        left_curvature_m, right_curvature_m, vehicle_offset_meters = \
+            get_curvature_and_offset(fitted_leftx_plot, fitted_rightx_plot, y_points_plot, warped_image_dimensions)
+    else:
+        rospy.logwarn_throttle(1.0,"BadPolyFit->DefaultCurv/Offset")
 
-def drive_car(angle,speed):
-    if motor_publisher is not None:
-        msg = XycarMotor(); msg.angle=float(angle); msg.speed=float(speed)
-        motor_publisher.publish(msg)
+    heading_error_rad, signed_curvature_factor_Am = 0.0, 0.0
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and \
+       all(arr is not None and arr.size > 0 for arr in [fitted_leftx_plot, fitted_rightx_plot, y_points_plot]):
+        heading_error_rad, signed_curvature_factor_Am = calculate_vehicle_heading_error(
+            fitted_leftx_plot, fitted_rightx_plot, y_points_plot, 
+            warped_image_dimensions[0], YM_PER_PIX_WARPED, XM_PER_PIX_WARPED
+        )
+    else:
+        rospy.logwarn_throttle(1.0, "Skipping heading error calculation due to missing lane fits.")
 
-def main_loop():
-    global current_image,motor_publisher,previous_left_fit,previous_right_fit,last_time_for_D,prev_vehicle_offset_m_for_D, integral_vehicle_offset_m
-    rospy.init_node('advanced_lane_keeping_node')
-    motor_publisher = rospy.Publisher('/xycar_motor',XycarMotor,queue_size=1)
-    rospy.Subscriber('/usb_cam/image_raw',Image,image_callback,queue_size=1)
-    rospy.loginfo("Waiting for image topics...")
-    while current_image is None and not rospy.is_shutdown():
-        rospy.loginfo_throttle(1.0,"No image received yet...")
+    current_timestamp = rospy.get_time()
+    delta_time = 0.0
+    if last_time_for_derivative_calc > 0: delta_time = current_timestamp - last_time_for_derivative_calc
+    
+    derivative_offset_term_contribution = 0.0
+    if delta_time > 0.001:
+        derivative_offset_term_contribution = (vehicle_offset_meters - previous_vehicle_offset_meters) / delta_time
+    
+    if delta_time > 0: accumulated_integral_offset_meters += vehicle_offset_meters * delta_time
+    accumulated_integral_offset_meters = np.clip(accumulated_integral_offset_meters, -MAX_INTEGRAL_TERM_VALUE, MAX_INTEGRAL_TERM_VALUE)
+    integral_offset_term_contribution = KI_LATERAL_OFFSET * accumulated_integral_offset_meters
+
+    previous_vehicle_offset_meters = vehicle_offset_meters
+    last_time_for_derivative_calc = current_timestamp
+
+    prop_offset_term = KP_LATERAL_OFFSET * vehicle_offset_meters
+    deriv_offset_term = KD_LATERAL_OFFSET * derivative_offset_term_contribution
+    prop_heading_term = KP_HEADING_ERROR * heading_error_rad
+    feedforward_curvature_term = K_FF_LANE_CURVATURE * signed_curvature_factor_Am
+    
+    target_steering_angle_rad = prop_offset_term + integral_offset_term_contribution + deriv_offset_term - prop_heading_term - feedforward_curvature_term
+    steering_angle_degrees = np.degrees(target_steering_angle_rad)
+    final_steering_angle_degrees = np.clip(steering_angle_degrees, -MAX_STEERING_ANGLE_DEGREES, MAX_STEERING_ANGLE_DEGREES)
+    
+    avg_lane_curvature_m = float('inf')
+    if left_curvature_m != float('inf') and right_curvature_m != float('inf'): avg_lane_curvature_m = (left_curvature_m + right_curvature_m) / 2.0
+    elif left_curvature_m != float('inf'): avg_lane_curvature_m = left_curvature_m
+    elif right_curvature_m != float('inf'): avg_lane_curvature_m = right_curvature_m
+
+    speed_based_on_curvature = MAX_SPEED
+    if avg_lane_curvature_m < 150: speed_based_on_curvature = MIN_SPEED_CURVE
+    elif avg_lane_curvature_m < 400: speed_based_on_curvature = 55.0
+    elif avg_lane_curvature_m < 800: speed_based_on_curvature = 70.0
+    
+    speed_based_on_angle = MAX_SPEED
+    abs_steering_angle = abs(final_steering_angle_degrees)
+    if abs_steering_angle < 5: speed_based_on_angle = MAX_SPEED
+    elif abs_steering_angle < 10: speed_based_on_angle = 80.0
+    elif abs_steering_angle < 20: speed_based_on_angle = 70.0
+    else: speed_based_on_angle = MIN_SPEED_ANGLE
+            
+    final_vehicle_speed = min(speed_based_on_curvature, speed_based_on_angle)
+
+    final_visualization_image = resized_original_bgr 
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and inv_perspective_matrix is not None:
+         final_visualization_image = draw_lane_visualization(
+            resized_original_bgr, warped_binary_mask.shape, inv_perspective_matrix, 
+            fitted_leftx_plot, fitted_rightx_plot, y_points_plot, 
+            left_curvature_m, right_curvature_m, vehicle_offset_meters, final_steering_angle_degrees
+        )
+    else:
+        font,font_scale,line_type,text_y,text_off = cv2.FONT_HERSHEY_SIMPLEX,0.6,2,30,25
+        cv2.putText(final_visualization_image,f"Curv:{left_curvature_m:.0f}/{right_curvature_m:.0f}(WarpErr)",(10,text_y),font,font_scale,(0,0,255),line_type)
+        cv2.putText(final_visualization_image,f"Off:{vehicle_offset_meters:.2f}(WarpErr)",(10,text_y+text_off),font,font_scale,(0,0,255),line_type)
+        cv2.putText(final_visualization_image,f"Steer:{final_steering_angle_degrees:.1f}(WarpErr)",(10,text_y+2*text_off),font,font_scale,(0,0,255),line_type)
+
+    debug_data = {
+        "vehicle_offset_m": vehicle_offset_meters, "heading_error_rad": heading_error_rad,
+        "target_steering_angle_rad": target_steering_angle_rad, "final_steering_angle_deg": final_steering_angle_degrees,
+        "speed_based_on_curvature": speed_based_on_curvature, "speed_based_on_angle": speed_based_on_angle,
+        "final_vehicle_speed": final_vehicle_speed,
+        "pid_p_offset": prop_offset_term, "pid_i_offset": integral_offset_term_contribution, 
+        "pid_d_offset": deriv_offset_term, "pid_p_heading": prop_heading_term, 
+        "ff_curvature": feedforward_curvature_term,
+        "left_curvature_m": left_curvature_m, "right_curvature_m": right_curvature_m,
+        "accumulated_integral_offset_m": accumulated_integral_offset_meters
+    }
+    return final_steering_angle_degrees, final_vehicle_speed, final_visualization_image, combined_binary_mask, warped_binary_mask, lane_search_visualization_img, debug_data
+
+def ros_image_callback(ros_img_msg):
+    global current_image_cv
+    current_image_cv = bridge.imgmsg_to_cv2(ros_img_msg, "bgr8")
+
+def publish_motor_commands(steering_angle, vehicle_speed):
+    if motor_control_publisher is not None:
+        motor_msg = XycarMotor()
+        motor_msg.angle = float(steering_angle)
+        motor_msg.speed = float(vehicle_speed)
+        motor_control_publisher.publish(motor_msg)
+
+def ros_main_loop():
+    global current_image_cv,motor_control_publisher,previous_left_polynomial_fit,previous_right_polynomial_fit, \
+           last_time_for_derivative_calc, prev_vehicle_offset_m_for_D, accumulated_integral_offset_meters
+    
+    rospy.init_node('advanced_lane_keeping_controller')
+    motor_control_publisher = rospy.Publisher('/xycar_motor',XycarMotor,queue_size=1)
+    rospy.Subscriber('/usb_cam/image_raw',Image,ros_image_callback,queue_size=1)
+    
+    rospy.loginfo("Waiting for initial image message...")
+    while current_image_cv is None and not rospy.is_shutdown():
+        rospy.loginfo_throttle(1.0,"Still no image received...")
         time.sleep(0.1)
-    rospy.loginfo("Image received. Starting advanced lane keeping node.")
-    print("▶▶▶ Advanced Lane Detection Algorithm Start")
-    last_time_for_D = rospy.get_time()
+    rospy.loginfo("Initial image received. Starting Advanced Lane Keeping Controller.")
+    print("▶▶▶ Advanced Lane Detection & Control Algorithm Initialized")
+
+    last_time_for_derivative_calc = rospy.get_time()
     prev_vehicle_offset_m_for_D = 0.0
-    integral_vehicle_offset_m = 0.0 # Initialize integral term
-    rate = rospy.Rate(20)
+    accumulated_integral_offset_meters = 0.0
+    
+    loop_rate = rospy.Rate(20) # Target 20 Hz
+
     while not rospy.is_shutdown():
-        if current_image is None:
-            rate.sleep(); continue
-        img_to_process = current_image.copy()
-        angle,speed,final_viz,combined_mask_viz,warped_viz,lane_search_viz,debug_info = process_image(img_to_process)
-        drive_car(angle,speed)
-        log_msg = (f"Off:{debug_info['center_diff']:.2f}m, HeadErr:{np.degrees(debug_info.get('heading_error_rad',0)):.1f}d, "
-                   f"RawSteer:{np.degrees(debug_info.get('target_angle_rad',0)):.1f}d, FinalSteer:{angle:.1f}d, "
-                   f"SpeedCrv:{debug_info.get('base_speed_for_curve',0):.0f}, SpeedAng:{debug_info.get('speed_due_to_angle',0):.0f}, FinalSpeed:{speed:.0f} | "
-                   f"P:{debug_info.get('pid_p_offset',0):.1f},I:{debug_info.get('pid_i_offset',0):.1f},D:{debug_info.get('pid_d_offset',0):.1f},H:{debug_info.get('pid_p_heading',0):.1f},FF:{debug_info.get('ff_curvature',0):.1f}")
-        rospy.loginfo(log_msg)
-        cv2.imshow("Final Visualization",final_viz)
-        cv2.imshow("Combined Binary Mask (ROI)",combined_mask_viz)
-        cv2.imshow("Warped Mask",warped_viz)
-        cv2.imshow("Lane Search Visualization",lane_search_viz)
-        if cv2.waitKey(1)&0xFF == ord('q'): break
-        rate.sleep()
+        if current_image_cv is None:
+            loop_rate.sleep(); continue
+            
+        local_image_copy = current_image_cv.copy()
+            
+        final_angle, final_speed, viz_final, viz_mask, viz_warped, viz_search, dbg_info = \
+            main_image_processing_pipeline(local_image_copy)
+        
+        publish_motor_commands(final_angle, final_speed)
+        
+        log_output_str = (
+            f"Off:{dbg_info['vehicle_offset_m']:.2f}m, HeadErr:{np.degrees(dbg_info.get('heading_error_rad',0)):.1f}d, "
+            f"RawSteer:{np.degrees(dbg_info.get('target_steering_angle_rad',0)):.1f}d, FinalSteer:{final_angle:.1f}d, "
+            f"SpeedCrv:{dbg_info.get('speed_based_on_curvature',0):.0f}, SpeedAng:{dbg_info.get('speed_based_on_angle',0):.0f}, FinalSpeed:{final_speed:.0f} | "
+            f"P:{dbg_info.get('pid_p_offset',0):.1f},I:{dbg_info.get('pid_i_offset',0):.1f},D:{dbg_info.get('pid_d_offset',0):.1f},H:{dbg_info.get('pid_p_heading',0):.1f},FF:{dbg_info.get('ff_curvature',0):.1f}"
+        )
+        rospy.loginfo(log_output_str)
+        
+        cv2.imshow("Final Lane Visualization", viz_final)
+        cv2.imshow("Combined Binary Mask (from ROI)", viz_mask)
+        cv2.imshow("Warped Binary Mask", viz_warped)
+        cv2.imshow("Lane Pixel Search Detail", viz_search)
+        
+        if cv2.waitKey(1)&0xFF == ord('q'):
+            rospy.loginfo("Shutdown key (q) pressed. Exiting.")
+            break
+        
+        loop_rate.sleep()
+
 if __name__ == '__main__':
-    try: main_loop()
-    except rospy.ROSInterruptException: rospy.loginfo("ROSInterruptException caught. Shutting down.")
-    except Exception as e: rospy.logerr(f"Unhandled exception in main_loop: {e}")
+    try:
+        ros_main_loop()
+    except rospy.ROSInterruptException:
+        rospy.loginfo("ROSInterruptException caught during shutdown. Node exiting.")
+    except Exception as e:
+        rospy.logerr(f"Unhandled critical exception in main: {e}")
     finally:
         cv2.destroyAllWindows()
-        rospy.loginfo("OpenCV windows closed. Node exiting.")
+        rospy.loginfo("OpenCV windows closed. Xycar controller node has shut down.")
