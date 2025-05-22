@@ -1,77 +1,91 @@
-# Xycar Lane Keeping Assistant
+# Advanced Lane Detection and Control for Xycar
 
-This project implements a ROS-based lane-keeping assistance system for the Xycar platform. It uses computer vision techniques to detect lane lines and control the vehicle's steering to stay within its lane.
+This project implements a ROS-based autonomous driving system for the Xycar platform, featuring an advanced lane detection pipeline and a PID with Feed-Forward steering controller.
 
 ## Core Functionality
 
-- **Image Processing:**
-  - Selects a Region of Interest (ROI) from the input camera image to focus on the road ahead.
-  - Converts the ROI to the HSV color space for more robust line detection under varying lighting conditions.
-- **Lane Line Detection:**
-  - Detects white and yellow lane lines using color thresholding in the HSV space.
-  - Generates binary masks for white and yellow lines.
-- **Steering Control:**
-  - **White Line Tracking:** Calculates an error based on the ratio of detected white pixels on the left and right sides of the ROI. It also uses the center of the detected white track to refine the steering angle.
-  - **Yellow Line Fallback:** If white lines are not sufficiently detected, the system attempts to track a yellow line, calculating steering based on its position.
-  - **"No Line" State:** If no lines are detected, the vehicle may be programmed to drive straight or hold the last known steering angle (currently drives straight).
-- **Speed Control:**
-  - Implements a basic dynamic speed adjustment strategy:
-    - Higher speeds when driving straight or with small steering angles.
-    - Reduced speeds for sharper turns, when line detection is poor ("OUTSIDE WARNING"), or when no lines are found.
-- **Steering Smoothing:**
-  - Limits the maximum change in steering angle per frame to ensure smoother vehicle motion.
-- **ROS Integration:**
-  - Operates as a ROS node.
-  - Subscribes to a camera image topic (e.g., `/usb_cam/image_raw`).
-  - Publishes motor commands (angle and speed) to `/xycar_motor` using `xycar_msgs/XycarMotor`.
-- **Visual Feedback:**
-  - Displays OpenCV windows showing:
-    - The original camera image.
-    - The selected Region of Interest (ROI).
-    - The binary masks for white and yellow lines.
-  - Logs status information (current mode, angle, speed) to the console via `rospy.loginfo`.
+The system processes camera images to detect lane lines, calculate lane geometry, and control the vehicle's steering and speed. The main pipeline stages are:
+
+1.  **Image Preprocessing (`preprocess_image`):**
+    *   Selects a Region of Interest (ROI) from the input camera image.
+    *   Converts the ROI to HLS and HSV color spaces.
+    *   Extracts individual H, L, S channels from HLS.
+
+2.  **Mask Creation (`create_masks`):**
+    *   Generates binary masks for white and yellow lane lines using HSV color thresholding.
+    *   Creates masks from HLS L-channel (brightness) and S-channel (saturation).
+    *   Applies Sobel edge detection (x-derivative on L-channel) and creates an edge mask.
+    *   Combines these masks (HSV color OR (S-channel AND Sobel edge)) to create a robust binary image highlighting potential lane features.
+
+3.  **Perspective Transformation (`perspective_transform`):**
+    *   Warps the combined binary mask into a bird's-eye view using a perspective transform.
+    *   Calculates both the forward (`M`) and inverse (`Minv`) transformation matrices.
+
+4.  **Lane Pixel Localization:**
+    *   **Histogram Analysis (`find_lane_starting_points`):** Calculates a histogram of the bottom half of the warped image to find initial base x-positions for the left and right lane lines.
+    *   **Sliding Window Search (`sliding_window_search`):** If sufficient pixels are found by the histogram, this method uses a series of sliding windows, starting from the identified base positions, to trace and collect non-zero pixels belonging to each lane line up the height of the image. Windows are re-centered based on the mean position of detected pixels.
+
+5.  **Polynomial Fitting (`fit_polynomial`):**
+    *   Fits 2nd order polynomials (ax^2 + bx + c) to the detected left and right lane pixel coordinates (from sliding window or previous frame).
+    *   Includes logic to use lane fits from the previous frame if the current frame's detection is weak (too few pixels).
+    *   Calculates the radius of curvature for each lane line and an average curvature (in meters).
+    *   Determines the vehicle's lateral offset (`center_diff`) from the center of the detected lane (in meters).
+
+6.  **Heading Error Calculation (`calculate_heading_error`):**
+    *   Calculates the lane's center line from the fitted left and right polynomials.
+    *   Fits a new polynomial to this center line in real-world meter space.
+    *   Determines the tangent to this center line at the bottom of the warped image.
+    *   Calculates the heading error (`e_psi`) as the arctangent of this tangent, representing the angle between the vehicle's path and the lane's direction.
+    *   Also computes a `signed_curvature_factor` (Am coefficient from the center line's meter-space polynomial) used for feed-forward control.
+
+7.  **Steering Control (PID + Feed-Forward in `process_image`):**
+    *   Calculates the derivative of the vehicle offset (`d_offset_dt`).
+    *   **PID Terms for Lateral Control:**
+        *   Proportional term based on `center_diff` (vehicle's lateral offset from lane center).
+        *   Integral term based on the accumulated `center_diff` to correct steady-state errors. (Includes anti-windup).
+        *   Derivative term based on the rate of change of `center_diff` (`d_offset_dt`) to dampen response and improve stability.
+        *   Proportional term based on `heading_error_rad` (angle between vehicle's path and lane's tangent).
+    *   **Feed-Forward Term:**
+        *   Based on the `signed_curvature_factor` (Am coefficient from the centerline's meter-space polynomial) to proactively steer into curves.
+    *   The final steering angle is a sum of these terms, converted to degrees, then clipped (e.g., to +/-35 degrees) and smoothed.
+
+8.  **Speed Control (Curvature-Aware in `process_image`):**
+    *   Determines a `base_speed_for_curve` based on the average lane curvature radius (slower for sharper curves).
+    *   Calculates a `speed_due_to_angle` based on the magnitude of the final steering angle (slower for larger steering angles).
+    *   The final speed is the minimum of these two values.
+
+9.  **Visualization (`visualize_lanes`):**
+    *   Draws the detected lane area (filled polygon) and fitted lane lines (as dots) on a bird's-eye view image.
+    *   Unwarps this visualization back to the original camera perspective.
+    *   Overlays the unwarped lane graphics onto the original camera image.
+    *   Displays text information: average curvature radius, vehicle offset, and final steering angle.
+    *   Additional debug windows show intermediate images (e.g., combined mask, warped image).
 
 ## Prerequisites
 
 ### Software
-
-- **Robot Operating System (ROS):**
-  - E.g., ROS Melodic (Ubuntu 18.04) or ROS Noetic (Ubuntu 20.04).
-  - Core ROS packages: `rospy`, `std_msgs`, `sensor_msgs`.
-- **Python:**
-  - Python 3.6+
-- **Python Libraries:**
-  - **OpenCV (`cv2`):** `pip install opencv-python`
-  - **NumPy:** `pip install numpy`
-- **ROS Packages:**
-  - **`cv_bridge`:** For ROS image conversion. Install via `sudo apt-get install ros-<your_ros_distro>-cv-bridge`.
-  - **`xycar_msgs`:** Custom messages for Xycar control (specifically `XycarMotor.msg`). Typically provided with Xycar setup.
+- **ROS (Robot Operating System):** e.g., Melodic, Noetic.
+- **Python 3**
+- **OpenCV (`cv2`)**
+- **NumPy**
+- **ROS Packages:** `cv_bridge`, `sensor_msgs`, `xycar_msgs` (for `XycarMotor.msg`).
+- **Matplotlib (Optional for Debugging):** Used for plotting histograms if available.
 
 ### Hardware
-
-- **Xycar Platform:** Or a similar ROS-compatible differential drive robot.
-- **Camera:** A monocular camera providing a raw image feed.
+- **Xycar Platform** (or similar ROS-compatible robot).
+- **Camera.**
 
 ## Installation & Setup
 
 1.  **ROS Workspace:**
-    - Create or use an existing Catkin workspace (e.g., `~/catkin_ws`).
-    - Place this package (e.g., named `xycar_lane_assist`) into `~/catkin_ws/src/`.
-      ```bash
-      cd ~/catkin_ws/src/
-      # git clone <repository_url> xycar_lane_assist # Or copy package here
-      ```
+    - Clone or place this package (e.g., `xycar_advanced_control`) into your Catkin workspace's `src/` directory.
 2.  **Python Dependencies:**
     ```bash
-    pip install numpy opencv-python
+    pip install numpy opencv-python matplotlib
     ```
 3.  **ROS Dependencies:**
-    - **`cv_bridge`:**
-      ```bash
-      sudo apt-get update
-      sudo apt-get install ros-<your_ros_distro>-cv-bridge
-      ```
-    - **`xycar_msgs`:** Ensure this package is in your workspace and built if it's not globally installed.
+    - Install `cv_bridge` (e.g., `sudo apt-get install ros-<distro>-cv-bridge`).
+    - Ensure `xycar_msgs` is built in your workspace.
 4.  **Build Workspace:**
     ```bash
     cd ~/catkin_ws
@@ -81,23 +95,51 @@ This project implements a ROS-based lane-keeping assistance system for the Xycar
 
 ## How to Run
 
-1.  **Start ROS Core:**
+1.  **Start ROS Core:** `roscore`
+2.  **Launch Camera Node.**
+3.  **Run the Lane Controller Node:**
     ```bash
-    roscore
+    # Example, replace 'xycar_advanced_control' with your package name
+    rosrun xycar_advanced_control sam_lane_keeping_xycar.py 
     ```
-2.  **Launch Camera Node (if applicable):**
-    - Ensure your camera is publishing to the `/usb_cam/image_raw` topic (or as configured in the script).
-    - Example: `roslaunch usb_cam usb_cam-test.launch`
-3.  **Run the Lane Keeping Node:**
-    - In a new terminal (after sourcing workspace):
-      ```bash
-      rosrun xycar_lane_assist sam_lane_keeping_xycar.py 
-      # Replace 'xycar_lane_assist' with your actual package name.
-      # The script itself is now 'sam_lane_keeping_xycar.py' but contains the lane keeping logic.
-      # Consider renaming the .py file to something like 'lane_keeping_node.py' for clarity.
-      ```
+    *Note: Consider renaming `sam_lane_keeping_xycar.py` to a name more reflective of its current advanced capabilities, like `advanced_lane_controller.py`.*
 
 ### ROS Topics
-
 - **Subscribed:** `/usb_cam/image_raw` (`sensor_msgs/Image`)
 - **Published:** `/xycar_motor` (`xycar_msgs/XycarMotor`)
+
+### Key Parameters & Tuning
+
+The following gains for the PID and Feed-Forward controller are defined at the top of `sam_lane_keeping_xycar.py` and **require careful tuning** for optimal performance in your specific environment:
+
+- `KP_OFFSET`: Proportional gain for lateral offset. Controls how strongly the car reacts to being off-center.
+- `KI_OFFSET`: Integral gain for lateral offset. Helps eliminate steady-state errors (e.g., consistent drift to one side). (Includes anti-windup).
+- `KD_OFFSET`: Derivative gain for lateral offset. Dampens oscillations and smooths the response to changes in offset.
+- `KP_HEADING`: Proportional gain for heading error. Controls how strongly the car corrects its angle relative to the lane.
+- `K_FF_CURVATURE`: Feed-forward gain for lane curvature. Allows the car to anticipate turns based on detected road curvature.
+
+Tuning these values is an iterative process. It's often recommended to tune P gains first, then D, then I, and finally the FF gain. Other parameters like ROI ratios, color thresholds, and perspective transform points (`SRC_POINTS_ROI_RATIOS`) also significantly impact performance and may need adjustment.
+
+### Adjusting Forward Detection Range in Bird's-Eye View
+
+If the `warped_mask` (bird's-eye view of detected lanes) appears to cover too short or too long a distance in front of the vehicle, you can adjust the following global constants at the top of the `sam_lane_keeping_xycar.py` script:
+
+-   **`ROI_Y_START_PERCENTAGE`**:
+    -   Controls how far down from the top of the *resized camera image* the Region of Interest (ROI) begins.
+    -   **To see further ahead:** Decrease this value (e.g., from `0.45` to `0.35`). This makes the ROI start higher up in the camera view.
+    -   **To focus closer:** Increase this value.
+    -   Ensure the ROI still captures relevant road sections.
+
+-   **`SRC_POINTS_ROI_RATIOS`** (Y-coordinates of the top points):
+    -   These define the top edge of the trapezoid on the *ROI image* that is warped into a rectangle. The Y-coordinates are ratios of the ROI's height (0.0 is ROI top, 1.0 is ROI bottom).
+    -   Example: `[0.40, 0.05]` (Top-Left). The `0.05` is the Y-ratio.
+    -   **To see further ahead within the current ROI:** Decrease these top Y-ratio values (e.g., from `0.05` to `0.0` or `0.02`). This pushes the top edge of the source trapezoid higher within the ROI.
+    -   **To focus the warp on nearer parts of the ROI:** Increase these top Y-ratio values.
+
+-   **`WARPED_IMAGE_HEIGHT_AS_ROI_RATIO`**:
+    -   Determines the height of the output bird's-eye view image relative to the height of the input ROI.
+    -   **To stretch the view further / increase perceived range:** Increase this ratio (e.g., from `2.5` to `3.0` or `3.5`). This gives more pixels to represent the road further away in the warped image.
+    -   **To make the warped view more compact vertically:** Decrease this ratio.
+
+**Tuning Process:**
+Adjust these parameters iteratively. Modifying `ROI_Y_START_PERCENTAGE` changes what part of the scene is processed. Modifying `SRC_POINTS_ROI_RATIOS` (top Y) changes which part of that ROI is considered "far away". Modifying `WARPED_IMAGE_HEIGHT_AS_ROI_RATIO` changes how that "far away" part is stretched or compressed in the bird's-eye view. Observe the "Warped Mask" and "Final Visualization" windows to see the effect of your changes.

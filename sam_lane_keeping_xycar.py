@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
 import rospy
@@ -6,742 +6,377 @@ import numpy as np
 import cv2
 import time
 from sensor_msgs.msg import Image
-from xycar_msgs.msg import XycarMotor # User confirmed this import works
+from xycar_msgs.msg import XycarMotor  # User-confirmed import
 from cv_bridge import CvBridge
 
+# --- Global Variables for ROS ---
 bridge = CvBridge()
-image = None
-motor_pub = None
-frame_count = 0
-prev_angle = 0.0
-white_lost_count = 0
-prev_left_fit_coeffs = None
-prev_right_fit_coeffs = None
-YM_PER_PIX = 30.0 / 720.0 # Default, will be updated in start() based on warped_image_height
-# XM_PER_PIX will be calculated dynamically. STANDARD_LANE_WIDTH_M / detected_lane_width_px
-STANDARD_LANE_WIDTH_M = 3.7 # Standard lane width in meters for XM_PER_PIX calculation
+current_image_cv = None  # Stores the latest image from the camera in OpenCV format
+motor_control_publisher = None # Publishes motor commands
+
+# --- Global State Variables for Lane Detection ---
+previous_left_polynomial_fit = None  # Stores coefficients of the left lane polynomial from the previous frame
+previous_right_polynomial_fit = None # Stores coefficients of the right lane polynomial from the previous frame
+previous_vehicle_offset_meters = 0.0 # Stores the vehicle's offset from the previous frame, for D-term calculation
+last_time_for_derivative_calc = 0.0  # Stores the timestamp of the last D-term calculation
+accumulated_integral_offset_meters = 0.0 # Stores the accumulated offset for the I-term
+
+# --- Configuration Constants ---
+
+# Image Processing
+ROI_Y_START_PERCENTAGE = 0.55  # Pixels from top of RESIZED image to start ROI. Decrease to see further ahead in ROI.
+ROI_Y_END_PERCENTAGE = 0.95    # End ROI at 95% of image height from the top
+IMAGE_RESIZED_WIDTH = 320      # Width for image resizing
+IMAGE_RESIZED_HEIGHT = 240     # Height for image resizing
+
+# HLS Color Thresholds (example values, may need tuning)
+H_THRESHOLD_YELLOW_LANE = (15, 35)    # Hue range for detecting yellow lanes
+L_THRESHOLD_UNIVERSAL_LANE = (30, 200) # Lightness range for general lane visibility
+S_THRESHOLD_WHITE_YELLOW_LANE = (100, 255) # Saturation range for white/yellow lanes
+
+# Perspective Transform: Source points (relative to ROI of resized image)
+# These define a trapezoid. Order: Top-Left, Top-Right, Bottom-Right, Bottom-Left.
+# MUST BE TUNED for the specific camera setup.
+SRC_POINTS_ROI_RATIOS = np.float32([
+    [0.40, 0.05],  # Top-left. Y-coord (0.05) is % of ROI height from ROI top. Smaller Y = further view.
+    [0.60, 0.05],  # Top-right. Y-coord (0.05) is % of ROI height from ROI top. Smaller Y = further view.
+    [0.95, 0.90],  # Bottom-right
+    [0.05, 0.90]   # Bottom-left
+])
+
+# Perspective Transform: Destination Parameters
+WARPED_IMAGE_WIDTH_AS_ROI_RATIO = 1.0  # Warped image width as a ratio of the ROI width
+WARPED_IMAGE_HEIGHT_AS_ROI_RATIO = 2.5 # Ratio of warped image height to ROI height. Larger stretches view further.
+
+# Sliding Window Algorithm Parameters
+SLIDING_WINDOW_COUNT = 10
+SLIDING_WINDOW_MARGIN_PERCENTAGE = 0.15 # Window margin as percentage of the warped image width
+MIN_PIXELS_FOR_RECENTERING = 50
+
+# Polynomial Search Margin (when using a previous fit)
+POLYNOMIAL_SEARCH_MARGIN_PERCENTAGE = 0.10 # Margin as percentage of the warped image width
+
+# Pixel-to-Meter Conversion Factors (Example values, MUST BE TUNED based on camera calibration and warped image dimensions)
+# These are critical for converting pixel measurements to real-world distances for curvature and offset.
+YM_PER_PIX_WARPED = 30.0 / 720.0  # Example: 30 meters visible vertically maps to 720 pixels in warped image height
+XM_PER_PIX_WARPED = 3.7 / 700.0   # Example: Standard 3.7m lane width maps to 700 pixels in warped image width
+
+# PID and Feed-Forward Controller Gains (CRITICAL: NEEDS EXTENSIVE TUNING)
+# =====================================================================================
+# These are initial placeholder values and WILL require significant tuning 
+# based on the specific vehicle dynamics (e.g., Xycar in Unity simulator or real hardware) 
+# and the characteristics of the track / environment.
+# =====================================================================================
+KP_LATERAL_OFFSET = 30.0      # Proportional gain for vehicle's lateral offset from lane center
+KI_LATERAL_OFFSET = 2.0       # Integral gain for lateral offset (helps eliminate steady-state error)
+KD_LATERAL_OFFSET = 10.0      # Derivative gain for lateral offset (helps dampen oscillations)
+KP_HEADING_ERROR = 25.0       # Proportional gain for heading error (angle between car and lane)
+K_FF_LANE_CURVATURE = 0.8     # Feed-forward gain for lane curvature (uses Am coefficient of centerline polynomial)
+MAX_INTEGRAL_TERM_VALUE = 0.5 # Anti-windup limit for the integral term of offset
+
+# Steering and Speed Limits
+MAX_STEERING_ANGLE_DEGREES = 35.0 # Max steering angle for Xycar (degrees)
+MAX_SPEED = 90.0
+MIN_SPEED_CURVE = 40.0
+MIN_SPEED_ANGLE = 50.0
 
 
-# --------------------------------------------------------------------
-# Image Preprocessing Helper Functions
-# --------------------------------------------------------------------
+def calculate_vehicle_heading_error(left_lane_fitx_px, right_lane_fitx_px, y_points_px, warped_image_height_px, ym_per_pix, xm_per_pix):
+    if left_lane_fitx_px is None or right_lane_fitx_px is None or \
+       left_lane_fitx_px.size == 0 or right_lane_fitx_px.size == 0 or y_points_px.size == 0:
+        return 0.0, 0.0
+    center_lane_x_px = (left_lane_fitx_px + right_lane_fitx_px) / 2.0
+    try:
+        center_lane_coeffs_meters = np.polyfit(y_points_px * ym_per_pix, center_lane_x_px * xm_per_pix, 2)
+    except (np.linalg.LinAlgError, TypeError, ValueError) as e:
+        rospy.logwarn_throttle(1.0, f"Polyfit failed for heading error calculation: {e}")
+        return 0.0, 0.0
+    y_eval_meters = warped_image_height_px * ym_per_pix
+    tangent_value = 2 * center_lane_coeffs_meters[0] * y_eval_meters + center_lane_coeffs_meters[1]
+    heading_error_radians = np.arctan(tangent_value)
+    signed_curvature_factor_Am = center_lane_coeffs_meters[0] if len(center_lane_coeffs_meters) > 0 else 0.0
+    return heading_error_radians, signed_curvature_factor_Am
 
-# --- Visualization Function ---
-def draw_lane_and_info(original_resized_bgr, binary_warped_img_shape, Minv_perspective, 
-                       left_fitx, right_fitx, ploty, 
-                       left_radius_m, right_radius_m, vehicle_offset_m):
-    """
-    Draws the detected lane area back onto the original image and displays curvature/offset.
-    """
-    final_image = original_resized_bgr.copy() # Start with the original image
+def preprocess_and_get_roi(bgr_image_input):
+    resized_bgr = cv2.resize(bgr_image_input, (IMAGE_RESIZED_WIDTH, IMAGE_RESIZED_HEIGHT), interpolation=cv2.INTER_AREA)
+    roi_y_start = int(IMAGE_RESIZED_HEIGHT * ROI_Y_START_PERCENTAGE)
+    roi_y_end = int(IMAGE_RESIZED_HEIGHT * ROI_Y_END_PERCENTAGE)
+    roi_bgr = resized_bgr[roi_y_start:roi_y_end, 0:IMAGE_RESIZED_WIDTH]
+    return roi_bgr, resized_bgr
 
-    # Handle cases where lane lines might not be detected or fits are empty
-    if left_fitx.size == 0 or right_fitx.size == 0 or ploty.size == 0:
-        # Draw text info even if lane area cannot be drawn
-        cv2.putText(final_image, f"L.Curv: {left_radius_m:.0f}m R.Curv: {right_radius_m:.0f}m", 
-                    (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2, cv2.LINE_AA) # Black text
-        cv2.putText(final_image, f"Offset: {vehicle_offset_m:.2f}m (No Lane Lines)", 
-                    (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,0), 2, cv2.LINE_AA)
-        return final_image
+def generate_lane_masks(roi_bgr_image):
+    hls_image = cv2.cvtColor(roi_bgr_image, cv2.COLOR_BGR2HLS)
+    h_channel, l_channel, s_channel = hls_image[:,:,0], hls_image[:,:,1], hls_image[:,:,2]
+    yellow_mask = np.zeros_like(h_channel)
+    yellow_mask[(h_channel >= H_THRESHOLD_YELLOW_LANE[0]) & (h_channel <= H_THRESHOLD_YELLOW_LANE[1]) &
+                (l_channel >= L_THRESHOLD_UNIVERSAL_LANE[0]) & (l_channel <= L_THRESHOLD_UNIVERSAL_LANE[1]) &
+                (s_channel >= S_THRESHOLD_WHITE_YELLOW_LANE[0]) & (s_channel <= S_THRESHOLD_WHITE_YELLOW_LANE[1])] = 255
+    white_mask = np.zeros_like(l_channel)
+    white_mask[(l_channel >= 180) & (s_channel <= 60)] = 255
+    combined_mask = cv2.bitwise_or(yellow_mask, white_mask)
+    return combined_mask, yellow_mask, white_mask
 
-    # Create an image to draw the lines on
-    warp_zero = np.zeros(binary_warped_img_shape, dtype=np.uint8) # Use shape of binary_warped_img
-    color_warp = np.dstack((warp_zero, warp_zero, warp_zero))
+def calculate_perspective_transform(image_to_warp, src_roi_ratios, warped_width_roi_ratio, warped_height_roi_ratio):
+    img_height, img_width = image_to_warp.shape[:2]
+    src_points_px = np.float32([[img_width * r[0], img_height * r[1]] for r in src_roi_ratios])
+    output_warped_width = int(img_width * warped_width_roi_ratio)
+    output_warped_height = int(img_height * warped_height_roi_ratio)
+    dst_points_px = np.float32([[0,0], [output_warped_width-1,0], 
+                                [output_warped_width-1,output_warped_height-1], [0,output_warped_height-1]])
+    transform_matrix = cv2.getPerspectiveTransform(src_points_px, dst_points_px)
+    inverse_transform_matrix = cv2.getPerspectiveTransform(dst_points_px, src_points_px)
+    warped_output_image = cv2.warpPerspective(image_to_warp, transform_matrix, 
+                                             (output_warped_width, output_warped_height), flags=cv2.INTER_LINEAR)
+    return warped_output_image, transform_matrix, inverse_transform_matrix
 
-    # Recast the x and y points into usable format for cv2.fillPoly()
-    pts_left = np.array([np.transpose(np.vstack([left_fitx, ploty]))])
-    pts_right_for_fill = np.array([np.flipud(np.transpose(np.vstack([right_fitx, ploty])))])
-    pts = np.hstack((pts_left, pts_right_for_fill))
-
-    # Draw the lane onto the warped blank image
-    cv2.fillPoly(color_warp, np.int_([pts]), (0, 255, 0)) # Green lane area
-
-    # Optional: Draw lane lines themselves (thicker)
-    cv2.polylines(color_warp, np.int_([pts_left]), isClosed=False, color=(255,0,0), thickness=10) # Blue for left
-    pts_right_for_line = np.array([np.transpose(np.vstack([right_fitx, ploty]))]) # No flip for polyline
-    cv2.polylines(color_warp, np.int_([pts_right_for_line]), isClosed=False, color=(0,0,255), thickness=10) # Red for right
-
-
-    # Warp the blank back to original image space using inverse perspective matrix (Minv)
-    original_size = (original_resized_bgr.shape[1], original_resized_bgr.shape[0])
-    newwarp = cv2.warpPerspective(color_warp, Minv_perspective, original_size) 
-    
-    # Combine the result with the original image
-    final_image = cv2.addWeighted(original_resized_bgr, 1, newwarp, 0.3, 0)
-
-    # Add text overlays for curvature and offset
-    curvature_text = f"L.Curv: {left_radius_m:.0f}m R.Curv: {right_radius_m:.0f}m"
-    if left_radius_m == float('inf') and right_radius_m == float('inf'):
-        curvature_text = "Curvature: Straight"
-    elif left_radius_m == float('inf'):
-        curvature_text = f"R.Curv: {right_radius_m:.0f}m"
-    elif right_radius_m == float('inf'):
-        curvature_text = f"L.Curv: {left_radius_m:.0f}m"
-        
-    cv2.putText(final_image, curvature_text, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA) # White text
-    cv2.putText(final_image, f"Offset: {vehicle_offset_m:.2f}m", (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,255), 2, cv2.LINE_AA)
-
-    return final_image
-
-# --- Curvature and Offset Calculation Functions ---
-def measure_curvature_real(ploty_px, left_fit_coeffs_px, right_fit_coeffs_px, H_warped_px, current_xm_per_pix):
-    """
-    Calculates the curvature of polynomial functions in meters.
-    """
-    global YM_PER_PIX # Use the global YM_PER_PIX updated in start()
-    left_curverad_m = float('inf')
-    right_curverad_m = float('inf')
-
-    if ploty_px is None or ploty_px.size == 0:
-        return left_curverad_m, right_curverad_m
-
-    # Define y-value where we want radius of curvature
-    # We'll choose the maximum y-value, corresponding to the bottom of the image
-    y_eval_px = np.max(ploty_px)
-    y_eval_m = y_eval_px * YM_PER_PIX
-
-    if left_fit_coeffs_px is not None:
-        # Recalculate fit in terms of meters
-        leftx_px = left_fit_coeffs_px[0]*ploty_px**2 + left_fit_coeffs_px[1]*ploty_px + left_fit_coeffs_px[2]
-        left_fit_cr_m = np.polyfit(ploty_px * YM_PER_PIX, leftx_px * current_xm_per_pix, 2)
-        A_m_left = left_fit_cr_m[0]
-        B_m_left = left_fit_cr_m[1]
-        if A_m_left != 0: # Avoid division by zero if line is straight
-            left_curverad_m = ((1 + (2*A_m_left*y_eval_m + B_m_left)**2)**1.5) / np.absolute(2*A_m_left)
-        # Else, curvature is infinite (straight line)
-
-    if right_fit_coeffs_px is not None:
-        rightx_px = right_fit_coeffs_px[0]*ploty_px**2 + right_fit_coeffs_px[1]*ploty_px + right_fit_coeffs_px[2]
-        right_fit_cr_m = np.polyfit(ploty_px * YM_PER_PIX, rightx_px * current_xm_per_pix, 2)
-        A_m_right = right_fit_cr_m[0]
-        B_m_right = right_fit_cr_m[1]
-        if A_m_right != 0: # Avoid division by zero
-            right_curverad_m = ((1 + (2*A_m_right*y_eval_m + B_m_right)**2)**1.5) / np.absolute(2*A_m_right)
-        # Else, curvature is infinite (straight line)
-        
-    return left_curverad_m, right_curverad_m
-
-def calculate_vehicle_offset(W_warped_px, left_fitx_bottom_px, right_fitx_bottom_px, current_xm_per_pix):
-    """
-    Calculates the vehicle offset from the center of the lane.
-    Offset is positive if vehicle is to the right of center, negative if to the left.
-    """
-    if left_fitx_bottom_px is None or right_fitx_bottom_px is None:
-        return 0.0 # Cannot determine offset if one lane is missing at the bottom
-
-    vehicle_center_px = W_warped_px / 2.0
-    lane_center_px = (left_fitx_bottom_px + right_fitx_bottom_px) / 2.0
-    offset_px = vehicle_center_px - lane_center_px # Positive if vehicle_center > lane_center (vehicle to the right of lane center)
-    offset_m = offset_px * current_xm_per_pix
-    return offset_m
-
-# --- Search Around Polynomial Function ---
-def search_around_poly(binary_warped, current_left_fit, current_right_fit, margin=80):
-    """
-    Finds lane pixels by searching around previously fitted polynomial lines.
-    Args:
-        binary_warped: Bird's-eye view binary image.
-        current_left_fit: Polynomial coefficients for the left lane from a previous fit.
-        current_right_fit: Polynomial coefficients for the right lane from a previous fit.
-        margin: Half-width of the search area around the polynomial lines.
-    Returns:
-        leftx, lefty, rightx, righty: Pixel coordinates for left and right lane lines.
-        out_img: Image with detected lane pixels drawn.
-    """
-    if current_left_fit is None and current_right_fit is None:
-        # Cannot search if no prior fits are available
-        out_img_blank = np.dstack((binary_warped, binary_warped, binary_warped)) if binary_warped.ndim == 2 else binary_warped.copy()
-        if np.max(binary_warped) == 1 and binary_warped.ndim == 2 : # If input is 0-1 binary
-             out_img_blank = out_img_blank * 255
-        return np.array([]), np.array([]), np.array([]), np.array([]), out_img_blank.astype(np.uint8)
-
-    nonzero = binary_warped.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-    
-    out_img = np.dstack((binary_warped, binary_warped, binary_warped)) if binary_warped.ndim == 2 else binary_warped.copy()
-    if np.max(binary_warped) == 1 and binary_warped.ndim == 2 : # If input is 0-1 binary
-        out_img = out_img * 255
-    out_img = out_img.astype(np.uint8)
-
-
-    left_lane_inds = np.array([], dtype=np.int32)
-    right_lane_inds = np.array([], dtype=np.int32)
-
-    if current_left_fit is not None:
-        left_fit_line_x = current_left_fit[0]*(nonzeroy**2) + current_left_fit[1]*nonzeroy + current_left_fit[2]
-        left_lane_inds_bool = (nonzerox >= left_fit_line_x - margin) & (nonzerox < left_fit_line_x + margin)
-        left_lane_inds = left_lane_inds_bool.nonzero()[0]
-
-
-    if current_right_fit is not None:
-        right_fit_line_x = current_right_fit[0]*(nonzeroy**2) + current_right_fit[1]*nonzeroy + current_right_fit[2]
-        right_lane_inds_bool = (nonzerox >= right_fit_line_x - margin) & (nonzerox < right_fit_line_x + margin)
-        right_lane_inds = right_lane_inds_bool.nonzero()[0]
-
-    leftx = nonzerox[left_lane_inds] if len(left_lane_inds) > 0 else np.array([])
-    lefty = nonzeroy[left_lane_inds] if len(left_lane_inds) > 0 else np.array([]) 
-    rightx = nonzerox[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
-    righty = nonzeroy[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
-
-    if len(leftx) > 0:
-        out_img[lefty, leftx] = [255, 0, 0] # Red
-    if len(rightx) > 0:
-        out_img[righty, rightx] = [0, 0, 255] # Blue
-        
-    return leftx, lefty, rightx, righty, out_img
-
-# --- Polynomial Fitting Function ---
-def fit_polynomial(leftx, lefty, rightx, righty, warped_height):
-    """
-    Fits a 2nd order polynomial to left and right lane pixel coordinates.
-    Args:
-        leftx, lefty: X and Y coordinates of left lane pixels.
-        rightx, righty: X and Y coordinates of right lane pixels.
-        warped_height: Height of the warped image (for generating ploty).
-    Returns:
-        left_fit: Coefficients of the polynomial for the left lane.
-        right_fit: Coefficients of the polynomial for the right lane.
-        left_fitx: X values of the fitted polynomial for the left lane.
-        right_fitx: X values of the fitted polynomial for the right lane.
-        ploty: Y values corresponding to left_fitx and right_fitx.
-    """
-    left_fit = None
-    right_fit = None
-    left_fitx = np.array([])
-    right_fitx = np.array([])
-
-    ploty = np.linspace(0, warped_height - 1, warped_height)
-
-    # Fit a second order polynomial to pixel positions in each fake lane line
-    if len(lefty) > 2 and len(leftx) > 2 : # Need at least 3 points to fit a 2nd order polynomial
-        left_fit = np.polyfit(lefty, leftx, 2)
-        left_fitx = left_fit[0]*ploty**2 + left_fit[1]*ploty + left_fit[2]
-    
-    if len(righty) > 2 and len(rightx) > 2: # Need at least 3 points
-        right_fit = np.polyfit(righty, rightx, 2)
-        right_fitx = right_fit[0]*ploty**2 + right_fit[1]*ploty + right_fit[2]
-        
-    return left_fit, right_fit, left_fitx, right_fitx, ploty
-
-# --- Sliding Window Lane Finding Function ---
-def find_lane_pixels_sliding_window(binary_warped, nwindows=10, margin=100, minpix=50):
-    """
-    Finds lane pixels using the sliding window method.
-    Args:
-        binary_warped: Bird's-eye view binary image.
-        nwindows: Number of sliding windows.
-        margin: Half-width of the windows.
-        minpix: Minimum number of pixels found to recenter window.
-    Returns:
-        leftx, lefty, rightx, righty: Pixel coordinates for left and right lane lines.
-        out_img: Image with sliding windows and detected lane pixels drawn.
-    """
-    # Take a histogram of the bottom half of the image
-    histogram = np.sum(binary_warped[binary_warped.shape[0]//2:,:], axis=0)
-    # Create an output image to draw on and visualize the result
-    if binary_warped.ndim == 2: # Ensure 3 channels for color drawing
-        out_img = np.dstack((binary_warped, binary_warped, binary_warped)) * 255
-    else:
-        out_img = binary_warped.copy() # Assuming it's already 3-channel if not 2D
-
-    # Find the peak of the left and right halves of the histogram
-    # These will be the starting point for the left and right lines
+def get_lane_start_points_from_histogram(binary_warped_image):
+    histogram = np.sum(binary_warped_image[binary_warped_image.shape[0]//2:, :], axis=0)
     midpoint = np.int(histogram.shape[0]/2)
-    leftx_base = np.argmax(histogram[:midpoint])
-    rightx_base = np.argmax(histogram[midpoint:]) + midpoint
+    left_base_x = np.argmax(histogram[:midpoint]) if midpoint > 0 and np.any(histogram[:midpoint]) else 0
+    right_base_x = np.argmax(histogram[midpoint:]) + midpoint if midpoint < histogram.shape[0] and np.any(histogram[midpoint:]) else histogram.shape[0]-1
+    return left_base_x, right_base_x
 
-    # Set height of windows
-    window_height = np.int(binary_warped.shape[0]/nwindows)
-    # Identify the x and y positions of all nonzero pixels in the image
-    nonzero = binary_warped.nonzero()
-    nonzeroy = np.array(nonzero[0])
-    nonzerox = np.array(nonzero[1])
-    # Current positions to be updated for each window
-    leftx_current = leftx_base
-    rightx_current = rightx_base
-    # Create empty lists to receive left and right lane pixel indices
-    left_lane_inds = []
-    right_lane_inds = []
+def perform_sliding_window_search(binary_warped_image, initial_leftx_base, initial_rightx_base):
+    output_visualization_img = np.dstack((binary_warped_image, binary_warped_image, binary_warped_image))
+    if np.max(binary_warped_image) <= 1 and binary_warped_image.ndim == 2: output_visualization_img *= 255 
+    output_visualization_img = output_visualization_img.astype(np.uint8)
+    window_height = np.int(binary_warped_image.shape[0] / SLIDING_WINDOW_COUNT)
+    margin_px = int(binary_warped_image.shape[1] * SLIDING_WINDOW_MARGIN_PERCENTAGE)
+    nonzero_pixels = binary_warped_image.nonzero()
+    nonzeroy_coords, nonzerox_coords = np.array(nonzero_pixels[0]), np.array(nonzero_pixels[1])
+    current_leftx, current_rightx = initial_leftx_base, initial_rightx_base
+    left_lane_pixel_indices, right_lane_pixel_indices = [], []
+    for window_idx in range(SLIDING_WINDOW_COUNT):
+        win_y_low = binary_warped_image.shape[0] - (window_idx + 1) * window_height
+        win_y_high = binary_warped_image.shape[0] - window_idx * window_height
+        win_xleft_low, win_xleft_high = current_leftx - margin_px, current_leftx + margin_px
+        win_xright_low, win_xright_high = current_rightx - margin_px, current_rightx + margin_px
+        cv2.rectangle(output_visualization_img, (win_xleft_low, win_y_low), (win_xleft_high, win_y_high), (0,255,0), 2) 
+        cv2.rectangle(output_visualization_img, (win_xright_low, win_y_low), (win_xright_high, win_y_high), (0,255,0), 2) 
+        good_left_indices = ((nonzeroy_coords >= win_y_low) & (nonzeroy_coords < win_y_high) & 
+                             (nonzerox_coords >= win_xleft_low) & (nonzerox_coords < win_xleft_high)).nonzero()[0]
+        good_right_indices = ((nonzeroy_coords >= win_y_low) & (nonzeroy_coords < win_y_high) & 
+                              (nonzerox_coords >= win_xright_low) & (nonzerox_coords < win_xright_high)).nonzero()[0]
+        left_lane_pixel_indices.append(good_left_indices)
+        right_lane_pixel_indices.append(good_right_indices)
+        if len(good_left_indices) > MIN_PIXELS_FOR_RECENTERING: current_leftx = np.int(np.mean(nonzerox_coords[good_left_indices]))
+        if len(good_right_indices) > MIN_PIXELS_FOR_RECENTERING: current_rightx = np.int(np.mean(nonzerox_coords[good_right_indices]))
+    left_lane_pixel_indices = np.concatenate(left_lane_pixel_indices) if len(left_lane_pixel_indices) > 0 and any(i.size > 0 for i in left_lane_pixel_indices) else np.array([], dtype=np.int32)
+    right_lane_pixel_indices = np.concatenate(right_lane_pixel_indices) if len(right_lane_pixel_indices) > 0 and any(i.size > 0 for i in right_lane_pixel_indices) else np.array([], dtype=np.int32)
+    final_leftx = nonzerox_coords[left_lane_pixel_indices] if left_lane_pixel_indices.size > 0 else np.array([])
+    final_lefty = nonzeroy_coords[left_lane_pixel_indices] if left_lane_pixel_indices.size > 0 else np.array([])
+    final_rightx = nonzerox_coords[right_lane_pixel_indices] if right_lane_pixel_indices.size > 0 else np.array([])
+    final_righty = nonzeroy_coords[right_lane_pixel_indices] if right_lane_pixel_indices.size > 0 else np.array([])
+    if len(final_leftx) > 0: output_visualization_img[final_lefty, final_leftx] = [255,0,0]
+    if len(final_rightx) > 0: output_visualization_img[final_righty, final_rightx] = [0,0,255]
+    return final_leftx, final_lefty, final_rightx, final_righty, output_visualization_img
 
-    # Step through the windows one by one
-    for window in range(nwindows):
-        # Identify window boundaries in x and y (and right and left)
-        win_y_low = binary_warped.shape[0] - (window+1)*window_height
-        win_y_high = binary_warped.shape[0] - window*window_height
-        win_xleft_low = leftx_current - margin
-        win_xleft_high = leftx_current + margin
-        win_xright_low = rightx_current - margin
-        win_xright_high = rightx_current + margin
-        # Draw the windows on the visualization image
-        cv2.rectangle(out_img,(win_xleft_low,win_y_low),(win_xleft_high,win_y_high),(0,255,0), 2) 
-        cv2.rectangle(out_img,(win_xright_low,win_y_low),(win_xright_high,win_y_high),(0,255,0), 2) 
-        # Identify the nonzero pixels in x and y within the window
-        good_left_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                          (nonzerox >= win_xleft_low) & (nonzerox < win_xleft_high)).nonzero()[0]
-        good_right_inds = ((nonzeroy >= win_y_low) & (nonzeroy < win_y_high) & 
-                           (nonzerox >= win_xright_low) & (nonzerox < win_xright_high)).nonzero()[0]
-        # Append these indices to the lists
-        left_lane_inds.append(good_left_inds)
-        right_lane_inds.append(good_right_inds)
-        # If you found > minpix pixels, recenter next window on their mean position
-        if len(good_left_inds) > minpix:
-            leftx_current = np.int(np.mean(nonzerox[good_left_inds]))
-        if len(good_right_inds) > minpix:        
-            rightx_current = np.int(np.mean(nonzerox[good_right_inds]))
+def search_lane_pixels_around_poly(binary_warped_image, polyfit_left, polyfit_right):
+    margin_px = int(binary_warped_image.shape[1] * POLYNOMIAL_SEARCH_MARGIN_PERCENTAGE)
+    nonzero_pixels = binary_warped_image.nonzero()
+    nonzeroy_coords, nonzerox_coords = np.array(nonzero_pixels[0]), np.array(nonzero_pixels[1])
+    output_visualization_img = np.dstack((binary_warped_image, binary_warped_image, binary_warped_image))
+    if np.max(binary_warped_image) <= 1 and binary_warped_image.ndim == 2: output_visualization_img *= 255
+    output_visualization_img = output_visualization_img.astype(np.uint8)
+    left_poly_line_x = polyfit_left[0]*(nonzeroy_coords**2) + polyfit_left[1]*nonzeroy_coords + polyfit_left[2]
+    left_lane_indices_bool = ((nonzerox_coords > left_poly_line_x - margin_px) & (nonzerox_coords < left_poly_line_x + margin_px))
+    right_poly_line_x = polyfit_right[0]*(nonzeroy_coords**2) + polyfit_right[1]*nonzeroy_coords + polyfit_right[2]
+    right_lane_indices_bool = ((nonzerox_coords > right_poly_line_x - margin_px) & (nonzerox_coords < right_poly_line_x + margin_px))
+    final_leftx, final_lefty = nonzerox_coords[left_lane_indices_bool], nonzeroy_coords[left_lane_indices_bool]
+    final_rightx, final_righty = nonzerox_coords[right_lane_indices_bool], nonzeroy_coords[right_lane_indices_bool]
+    if len(final_leftx) > 0: output_visualization_img[final_lefty, final_leftx] = [255,0,0]
+    if len(final_rightx) > 0: output_visualization_img[final_righty, final_rightx] = [0,0,255]
+    return final_leftx, final_lefty, final_rightx, final_righty, output_visualization_img
 
-    # Concatenate the arrays of indices
-    try:
-        left_lane_inds = np.concatenate(left_lane_inds)
-        right_lane_inds = np.concatenate(right_lane_inds)
-    except ValueError:
-        # Handle cases where no pixels were found in any window
-        pass # Keep them as empty lists or empty np.arrays
+def apply_polynomial_fit(detected_leftx_px, detected_lefty_px, detected_rightx_px, detected_righty_px, warped_image_h_px):
+    global previous_left_polynomial_fit, previous_right_polynomial_fit
+    current_left_fit, current_right_fit = None, None
+    # Ensure at least 3 points for a 2nd degree polynomial
+    if len(detected_leftx_px) > 2 and len(detected_lefty_px) > 2:
+        try: current_left_fit = np.polyfit(detected_lefty_px, detected_leftx_px, 2)
+        except (np.RankWarning, Exception) as e: rospy.logwarn_throttle(1.0,f"LFitFail:{e}"); current_left_fit=previous_left_polynomial_fit
+    else: current_left_fit=previous_left_polynomial_fit
+    if len(detected_rightx_px) > 2 and len(detected_righty_px) > 2:
+        try: current_right_fit = np.polyfit(detected_righty_px, detected_rightx_px, 2)
+        except (np.RankWarning, Exception) as e: rospy.logwarn_throttle(1.0,f"RFitFail:{e}"); current_right_fit=previous_right_polynomial_fit
+    else: current_right_fit=previous_right_polynomial_fit
+    y_points_for_plotting = np.linspace(0,warped_image_h_px-1,warped_image_h_px)
+    fitted_leftx_px, fitted_rightx_px = np.array([]), np.array([])
+    if current_left_fit is not None:
+        fitted_leftx_px = current_left_fit[0]*y_points_for_plotting**2+current_left_fit[1]*y_points_for_plotting+current_left_fit[2]
+        previous_left_polynomial_fit = current_left_fit
+    if current_right_fit is not None:
+        fitted_rightx_px = current_right_fit[0]*y_points_for_plotting**2+current_right_fit[1]*y_points_for_plotting+current_right_fit[2]
+        previous_right_polynomial_fit = current_right_fit
+    return current_left_fit, current_right_fit, fitted_leftx_px, fitted_rightx_px, y_points_for_plotting
 
-    # Extract left and right line pixel positions
-    leftx = nonzerox[left_lane_inds] if len(left_lane_inds) > 0 else np.array([])
-    lefty = nonzeroy[left_lane_inds] if len(left_lane_inds) > 0 else np.array([]) 
-    rightx = nonzerox[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
-    righty = nonzeroy[right_lane_inds] if len(right_lane_inds) > 0 else np.array([])
+def get_curvature_and_offset(fitted_leftx_px, fitted_rightx_px, y_points_for_plotting, warped_image_dims_px):
+    warped_h_px, warped_w_px = warped_image_dims_px
+    y_eval_px = np.max(y_points_for_plotting) if y_points_for_plotting.size > 0 else warped_h_px - 1
+    left_curvature_m, right_curvature_m = float('inf'), float('inf')
+    if len(fitted_leftx_px)>0 and len(y_points_for_plotting)>0:
+        left_fit_coeffs_meters = np.polyfit(y_points_for_plotting*YM_PER_PIX_WARPED,fitted_leftx_px*XM_PER_PIX_WARPED,2)
+        if abs(left_fit_coeffs_meters[0]) > 1e-9 : left_curvature_m = ((1+(2*left_fit_coeffs_meters[0]*y_eval_px*YM_PER_PIX_WARPED+left_fit_coeffs_meters[1])**2)**1.5)/np.absolute(2*left_fit_coeffs_meters[0])
+    if len(fitted_rightx_px)>0 and len(y_points_for_plotting)>0:
+        right_fit_coeffs_meters = np.polyfit(y_points_for_plotting*YM_PER_PIX_WARPED,fitted_rightx_px*XM_PER_PIX_WARPED,2)
+        if abs(right_fit_coeffs_meters[0]) > 1e-9 : right_curvature_m = ((1+(2*right_fit_coeffs_meters[0]*y_eval_px*YM_PER_PIX_WARPED+right_fit_coeffs_meters[1])**2)**1.5)/np.absolute(2*right_fit_coeffs_meters[0])
+    lane_center_px = (fitted_leftx_px[-1]+fitted_rightx_px[-1])/2 if len(fitted_leftx_px)>0 and len(fitted_rightx_px)>0 else warped_w_px/2
+    vehicle_center_px = warped_w_px/2
+    offset_meters = (vehicle_center_px-lane_center_px)*XM_PER_PIX_WARPED
+    return left_curvature_m,right_curvature_m,offset_meters
 
-    # Color lane pixels
-    if len(left_lane_inds) > 0:
-        out_img[lefty, leftx] = [255, 0, 0] # Red
-    if len(right_lane_inds) > 0:
-        out_img[righty, rightx] = [0, 0, 255] # Blue
+def draw_lane_visualization(original_bgr_image, warped_binary_image_shape, inv_perspective_matrix, 
+                            fitted_leftx_px, fitted_rightx_px, y_points_for_plotting, 
+                            left_curvature_m, right_curvature_m, vehicle_offset_m, final_steering_angle_deg):
+    output_image = original_bgr_image.copy()
+    font, font_scale, font_color, line_type = cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,255,255), 2
+    text_y_start, text_y_offset = 30, 25
+    if fitted_leftx_px.size==0 or fitted_rightx_px.size==0 or y_points_for_plotting.size==0:
+        avg_curvature = (left_curvature_m + right_curvature_m)/2 if left_curvature_m!=float('inf') and right_curvature_m!=float('inf') else (left_curvature_m if left_curvature_m!=float('inf') else right_curvature_m)
+        cv2.putText(output_image, f"Curv: {avg_curvature:.0f}m" if avg_curvature!=float('inf') else "Curv: Straight", (10,text_y_start), font,font_scale,(0,0,0),line_type)
+        cv2.putText(output_image, f"Offset:{vehicle_offset_m:.2f}m(NoLines)", (10,text_y_start+text_y_offset), font,font_scale,(0,0,0),line_type)
+        cv2.putText(output_image, f"Steer: {final_steering_angle_deg:.1f}deg", (10,text_y_start+2*text_y_offset), font,font_scale,(0,0,0),line_type)
+        return output_image
+    warp_color_overlay = np.zeros(warped_binary_image_shape,dtype=np.uint8)
+    color_warp_rgb = np.dstack((warp_color_overlay,warp_color_overlay,warp_color_overlay))
+    left_lane_points = np.array([np.transpose(np.vstack([fitted_leftx_px,y_points_for_plotting]))])
+    right_lane_points_for_fill = np.array([np.flipud(np.transpose(np.vstack([fitted_rightx_px,y_points_for_plotting])))])
+    lane_polygon_points = np.hstack((left_lane_points,right_lane_points_for_fill))
+    cv2.fillPoly(color_warp_rgb,np.int_([lane_polygon_points]),(0,255,0))
+    cv2.polylines(color_warp_rgb,np.int_([left_lane_points]),isClosed=False,color=(255,0,0),thickness=10)
+    right_lane_points_for_line = np.array([np.transpose(np.vstack([fitted_rightx_px,y_points_for_plotting]))])
+    cv2.polylines(color_warp_rgb,np.int_([right_lane_points_for_line]),isClosed=False,color=(0,0,255),thickness=10)
+    unwarped_lane_overlay = cv2.warpPerspective(color_warp_rgb,inv_perspective_matrix,(original_bgr_image.shape[1],original_bgr_image.shape[0])) 
+    output_image = cv2.addWeighted(output_image,1,unwarped_lane_overlay,0.3,0)
+    avg_curvature = (left_curvature_m + right_curvature_m)/2 if left_curvature_m!=float('inf') and right_curvature_m!=float('inf') else (left_curvature_m if left_curvature_m!=float('inf') else right_curvature_m)
+    curvature_text = f"Curv: {avg_curvature:.0f}m" if avg_curvature!=float('inf') else "Curv: Straight"
+    cv2.putText(output_image,curvature_text,(10,text_y_start),font,font_scale,font_color,line_type)
+    cv2.putText(output_image,f"Offset: {vehicle_offset_m:.2f}m",(10,text_y_start+text_y_offset),font,font_scale,font_color,line_type)
+    cv2.putText(output_image,f"Steer Angle: {final_steering_angle_deg:.1f}deg",(10,text_y_start+2*text_y_offset),font,font_scale,font_color,line_type)
+    return output_image
 
-    return leftx, lefty, rightx, righty, out_img
-
-# --- Perspective Transform Function ---
-def warp_image(img_roi, src_points_roi, dst_points_transform, dsize_warp):
-    """
-    Applies a perspective transform to warp the image.
-    Args:
-        img_roi: Input image (Region of Interest).
-        src_points_roi: np.float32 array of 4 source points in the ROI.
-        dst_points_transform: np.float32 array of 4 destination points.
-        dsize_warp: Tuple (width, height) for the output warped image size.
-    Returns:
-        warped_img: The perspective-warped image.
-        M: The perspective transform matrix.
-        Minv: The inverse perspective transform matrix.
-    """
-    M = cv2.getPerspectiveTransform(src_points_roi, dst_points_transform)
-    Minv = cv2.getPerspectiveTransform(dst_points_transform, src_points_roi)
-    warped_img = cv2.warpPerspective(img_roi, M, dsize_warp, flags=cv2.INTER_LINEAR)
-    return warped_img, M, Minv
-
-def apply_hls_thresholds(hls_image, thresh_h, thresh_l, thresh_s):
-    """
-    Applies H, L, S thresholds to an HLS image and combines them.
-    Args:
-        hls_image: Input image in HLS color space.
-        thresh_h: Tuple (low, high) for H channel threshold.
-        thresh_l: Tuple (low, high) for L channel threshold.
-        thresh_s: Tuple (low, high) for S channel threshold.
-    Returns:
-        A binary image resulting from the combined thresholds.
-    """
-    h_channel = hls_image[:,:,0]
-    l_channel = hls_image[:,:,1]
-    s_channel = hls_image[:,:,2]
-
-    # Apply thresholds
-    h_binary = np.zeros_like(h_channel)
-    h_binary[(h_channel >= thresh_h[0]) & (h_channel <= thresh_h[1])] = 255
-
-    l_binary = np.zeros_like(l_channel)
-    l_binary[(l_channel >= thresh_l[0]) & (l_channel <= thresh_l[1])] = 255
-    
-    s_binary = np.zeros_like(s_channel)
-    s_binary[(s_channel >= thresh_s[0]) & (s_channel <= thresh_s[1])] = 255
-
-    # Combination logic from the blog post
-    # combined_binary[((s_binary == 255) & (l_binary == 0)) | ((s_binary == 0) & (h_binary == 255) & (l_binary == 255))] = 255
-    # Corrected logic based on common practice (usually ORing or ANDing specific conditions)
-    # The blog's specific logic:
-    # "흰색 영역: S 값이 높고(255) L 값은 낮은(0) 픽셀" -> s_binary AND (NOT l_binary)
-    # "노란색 영역: S 값이 낮고(0) H 값과 L 값이 모두 높은(255) 픽셀" -> (NOT s_binary) AND h_binary AND l_binary
-    # This seems to target very specific shades. Let's use the direct logic given.
-    combined_binary = np.zeros_like(s_channel, dtype=np.uint8)
-    
-    # Condition from blog: ((s_binary == 255) & (l_binary == 0)) | ((s_binary == 0) & (h_binary == 255) & (l_binary == 255))
-    # To apply this, we need to consider that l_binary is 255 where it meets its threshold, 0 otherwise.
-    # So, "l_binary == 0" means l_channel is *outside* its threshold range.
-    # For "l_binary == 255", it means l_channel is *inside* its threshold range.
-
-    # Let's re-evaluate the blog's logic carefully:
-    # 흰색 영역: S 값이 높고(thresh_s) L 값은 낮은(not thresh_l) 픽셀
-    # 노란색 영역: S 값이 낮고(not thresh_s) H 값과 L 값이 모두 높은(thresh_h and thresh_l) 픽셀
-    # The blog's combined_binary line implies specific values (0 or 255) rather than ranges.
-    # For this implementation, we will use the provided complex condition directly on the binary masks.
-    
-    # Condition 1: (s_binary == 255) AND (l_binary == 0)
-    # This means S is in its range, L is NOT in its range (e.g., L is low if thresh_l is for high L values)
-    # If thresh_l = (50, 160), then l_binary==0 means l_channel < 50 or l_channel > 160.
-    # The blog seems to interpret l_binary == 0 as "L is low".
-    # The blog states: "L 값은 낮은(0) 픽셀" which is ambiguous.
-    # Let's assume the blog means S is high AND L is low (e.g. L < some_low_fixed_value like 50)
-    # OR S is low AND H is high AND L is high.
-    # Given the direct formula: combined_binary[((s_binary == 255) & (l_binary == 0)) | ((s_binary == 0) & (h_binary == 255) & (l_binary == 255))] = 255
-    # This means:
-    # 1. s_channel is within its threshold AND l_channel is NOT within its threshold.
-    # OR
-    # 2. s_channel is NOT within its threshold AND h_channel IS within its threshold AND l_channel IS within its threshold.
-    
-    cond1 = (s_binary == 255) & (l_binary == 0) # S is high, L is out of its main range (potentially low or very high)
-    cond2 = (s_binary == 0) & (h_binary == 255) & (l_binary == 255) # S is out of range, H is in range, L is in range
-    
-    combined_binary[cond1 | cond2] = 255
-    
-    return combined_binary
-
-def apply_sobel_threshold(image_channel, orient='x', ksize=3, thresh=(20, 100)):
-    """
-    Applies Sobel derivative thresholding to a single image channel.
-    Args:
-        image_channel: Single channel grayscale image.
-        orient: Orientation of the Sobel derivative ('x' or 'y').
-        ksize: Kernel size for Sobel operator.
-        thresh: Tuple (low, high) for thresholding the scaled Sobel derivative.
-    Returns:
-        A binary image.
-    """
-    if orient == 'x':
-        sobel = cv2.Sobel(image_channel, cv2.CV_64F, 1, 0, ksize=ksize)
-    elif orient == 'y':
-        sobel = cv2.Sobel(image_channel, cv2.CV_64F, 0, 1, ksize=ksize)
+def main_image_processing_pipeline(cv_image):
+    global previous_left_polynomial_fit, previous_right_polynomial_fit, prev_vehicle_offset_m_for_D, last_time_for_derivative_calc, accumulated_integral_offset_meters
+    roi_image_bgr, resized_original_bgr = preprocess_and_get_roi(cv_image)
+    combined_binary_mask, _, _ = generate_lane_masks(roi_image_bgr)
+    warped_binary_mask, perspective_matrix, inverse_perspective_matrix = calculate_perspective_transform(
+        combined_binary_mask, PERSPECTIVE_SRC_POINTS_ROI_RATIOS, 
+        WARPED_IMAGE_WIDTH_AS_ROI_RATIO, WARPED_IMAGE_HEIGHT_AS_ROI_RATIO
+    )
+    warped_image_dimensions = (warped_binary_mask.shape[0], warped_binary_mask.shape[1])
+    if previous_left_polynomial_fit is not None and previous_right_polynomial_fit is not None:
+        detected_leftx,detected_lefty,detected_rightx,detected_righty,lane_search_visualization_img = search_lane_pixels_around_poly(warped_binary_mask,previous_left_polynomial_fit,previous_right_polynomial_fit)
+        if len(detected_leftx)<MIN_PIXELS_FOR_RECENTERING or len(detected_rightx)<MIN_PIXELS_FOR_RECENTERING:
+            rospy.logwarn_throttle(1.0,"SearchPolyFail->SlideWin")
+            initial_leftx_base, initial_rightx_base = get_lane_start_points_from_histogram(warped_binary_mask) # Removed _ from histogram
+            detected_leftx,detected_lefty,detected_rightx,detected_righty,lane_search_visualization_img = perform_sliding_window_search(warped_binary_mask,initial_leftx_base,initial_rightx_base)
     else:
-        raise ValueError("orient must be 'x' or 'y'")
+        initial_leftx_base, initial_rightx_base, _ = get_lane_start_points_from_histogram(warped_binary_mask) # Keep _ if histogram not needed elsewhere
+        detected_leftx,detected_lefty,detected_rightx,detected_righty,lane_search_visualization_img = perform_sliding_window_search(warped_binary_mask,initial_leftx_base,initial_rightx_base)
+    current_left_fit_coeffs, current_right_fit_coeffs, fitted_leftx_plot, fitted_rightx_plot, y_points_plot = apply_polynomial_fit(detected_leftx,detected_lefty,detected_rightx,detected_righty,warped_image_dimensions[0])
+    vehicle_offset_meters = 0.0; left_curvature_m,right_curvature_m = float('inf'),float('inf')
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and len(fitted_leftx_plot)>0 and len(fitted_rightx_plot)>0:
+        left_curvature_m,right_curvature_m,vehicle_offset_meters = get_curvature_and_offset(fitted_leftx_plot,fitted_rightx_plot,y_points_plot,warped_image_dimensions)
+    else: rospy.logwarn_throttle(1.0,"BadPolyFit->DefaultCurv/Offset")
+    heading_error_rad,signed_curvature_factor_Am = 0.0,0.0
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and all(arr is not None and arr.size>0 for arr in [fitted_leftx_plot,fitted_rightx_plot,y_points_plot]):
+        heading_error_rad,signed_curvature_factor_Am = calculate_vehicle_heading_error(fitted_leftx_plot,fitted_rightx_plot,y_points_plot,warped_image_dimensions[0],YM_PER_PIX_WARPED,XM_PER_PIX_WARPED)
+    else: rospy.logwarn_throttle(1.0,"SkipHeadingErr->MissingFits")
+    current_timestamp = rospy.get_time(); delta_time=0.0
+    if last_time_for_derivative_calc>0: delta_time = current_timestamp-last_time_for_derivative_calc
+    derivative_offset_term_contribution = (vehicle_offset_meters-previous_vehicle_offset_meters)/delta_time if delta_time>0.001 else 0.0
+    if delta_time>0: accumulated_integral_offset_meters += vehicle_offset_meters*delta_time
+    accumulated_integral_offset_meters = np.clip(accumulated_integral_offset_meters,-MAX_INTEGRAL_TERM_VALUE,MAX_INTEGRAL_TERM_VALUE)
+    integral_offset_term_contribution = KI_LATERAL_OFFSET*accumulated_integral_offset_meters
+    previous_vehicle_offset_meters,last_time_for_derivative_calc = vehicle_offset_meters,current_timestamp
+    prop_offset_term = KP_LATERAL_OFFSET*vehicle_offset_meters
+    deriv_offset_term = KD_LATERAL_OFFSET*derivative_offset_term_contribution
+    prop_heading_term = KP_HEADING_ERROR*heading_error_rad
+    feedforward_curvature_term = K_FF_LANE_CURVATURE*signed_curvature_factor_Am
+    target_steering_angle_rad = prop_offset_term+integral_offset_term_contribution+deriv_offset_term-prop_heading_term-feedforward_curvature_term
+    steering_angle_degrees = np.degrees(target_steering_angle_rad)
+    final_steering_angle_degrees = np.clip(steering_angle_degrees,-MAX_STEERING_ANGLE_DEGREES,MAX_STEERING_ANGLE_DEGREES)
+    avg_lane_curvature_m = float('inf')
+    if left_curvature_m!=float('inf') and right_curvature_m!=float('inf'): avg_lane_curvature_m = (left_curvature_m+right_curvature_m)/2.0
+    elif left_curvature_m!=float('inf'): avg_lane_curvature_m = left_curvature_m
+    elif right_curvature_m!=float('inf'): avg_lane_curvature_m = right_curvature_m
+    speed_based_on_curvature = MAX_SPEED
+    if avg_lane_curvature_m<150: speed_based_on_curvature = MIN_SPEED_CURVE
+    elif avg_lane_curvature_m<400: speed_based_on_curvature = 55.0
+    elif avg_lane_curvature_m<800: speed_based_on_curvature = 70.0
+    speed_based_on_angle = MAX_SPEED; abs_steering_angle = abs(final_steering_angle_degrees)
+    if abs_steering_angle<5: speed_based_on_angle = MAX_SPEED
+    elif abs_steering_angle<10: speed_based_on_angle = 80.0
+    elif abs_steering_angle<20: speed_based_on_angle = 70.0
+    else: speed_based_on_angle = MIN_SPEED_ANGLE
+    final_vehicle_speed = min(speed_based_on_curvature,speed_based_on_angle)
+    final_visualization_image = resized_original_bgr 
+    if current_left_fit_coeffs is not None and current_right_fit_coeffs is not None and inverse_perspective_matrix is not None:
+         final_visualization_image = draw_lane_visualization(resized_original_bgr,warped_binary_mask.shape,inverse_perspective_matrix,fitted_leftx_plot,fitted_rightx_plot,y_points_plot,left_curvature_m,right_curvature_m,vehicle_offset_meters,final_steering_angle_degrees)
+    else:
+        font,font_scale,line_type,text_y,text_off = cv2.FONT_HERSHEY_SIMPLEX,0.6,2,30,25
+        cv2.putText(final_visualization_image,f"Curv:{left_curvature_m:.0f}/{right_curvature_m:.0f}(WarpErr)",(10,text_y),font,font_scale,(0,0,255),line_type)
+        cv2.putText(final_visualization_image,f"Off:{vehicle_offset_meters:.2f}(WarpErr)",(10,text_y+text_off),font,font_scale,(0,0,255),line_type)
+        cv2.putText(final_visualization_image,f"Steer:{final_steering_angle_degrees:.1f}(WarpErr)",(10,text_y+2*text_off),font,font_scale,(0,0,255),line_type)
+    debug_data = {"vehicle_offset_m":vehicle_offset_meters,"heading_error_rad":heading_error_rad,
+                  "target_steering_angle_rad":target_steering_angle_rad,"final_steering_angle_deg":final_steering_angle_degrees,
+                  "speed_based_on_curvature":speed_based_on_curvature,"speed_based_on_angle":speed_based_on_angle,
+                  "final_vehicle_speed":final_vehicle_speed,
+                  "pid_p_offset":prop_offset_term,"pid_i_offset":integral_offset_term_contribution, 
+                  "pid_d_offset":deriv_offset_term,"pid_p_heading":prop_heading_term, 
+                  "ff_curvature":feedforward_curvature_term,
+                  "left_curvature_m":left_curvature_m,"right_curvature_m":right_curvature_m,
+                  "accumulated_integral_offset_m":accumulated_integral_offset_meters}
+    return final_steering_angle_degrees,final_vehicle_speed,final_visualization_image,combined_binary_mask,warped_binary_mask,lane_search_visualization_img,debug_data
 
-    abs_sobel = np.absolute(sobel)
-    scaled_sobel = np.uint8(255 * abs_sobel / np.max(abs_sobel))
-    
-    binary_output = np.zeros_like(scaled_sobel)
-    binary_output[(scaled_sobel >= thresh[0]) & (scaled_sobel <= thresh[1])] = 255
-    return binary_output
+def ros_image_callback(ros_img_msg):
+    global current_image_cv
+    current_image_cv = bridge.imgmsg_to_cv2(ros_img_msg,"bgr8")
 
-def preprocess_pipeline(bgr_image, roi_coords):
-    """
-    Applies ROI slicing and HLS thresholding.
-    Args:
-        bgr_image: Input BGR image.
-        roi_coords: Tuple (y_start, y_end, x_start, x_end) for ROI.
-    Returns:
-        A binary image processed for lane detection within the ROI.
-    """
-    y_start, y_end, x_start, x_end = roi_coords
-    roi_image = bgr_image[y_start:y_end, x_start:x_end]
+def publish_motor_commands(steering_angle,vehicle_speed):
+    if motor_control_publisher is not None:
+        motor_msg = XycarMotor(); motor_msg.angle=float(steering_angle); motor_msg.speed=float(vehicle_speed)
+        motor_control_publisher.publish(motor_msg)
 
-    hls_roi_image = cv2.cvtColor(roi_image, cv2.COLOR_BGR2HLS)
-
-    # Thresholds from the blog post (may need tuning)
-    # H for yellow, L for general brightness, S for saturation (helps with white)
-    th_h = (15, 35)    # Hue range for yellow (typical for yellow)
-    th_l = (30, 200)   # Lightness range (broad to capture lines in shadows/highlights)
-    th_s = (100, 255)  # Saturation range (high saturation for strong colors like yellow, also helps white)
-    
-    # The blog's HLS combination logic is specific:
-    # combined_binary[((s_binary == 255) & (l_binary == 0)) | ((s_binary == 0) & (h_binary == 255) & (l_binary == 255))] = 255
-    # For this to work as intended by the blog, the binary images need to be generated with ranges that make sense for the conditions.
-    # Let's adjust the HLS thresholds to typical values for robust white/yellow detection first,
-    # then attempt the blog's combination logic if direct combination is not good enough.
-    # For now, using the blog's direct complex combination logic with these more standard ranges for individual channels.
-    # The blog's example thresholds were: th_h, th_l, th_s = (160, 255), (50, 160), (0, 255)
-    # These seem unusual (H=160-255 is more like magenta/red). Let's use the ones from the prompt for now.
-    # Prompt's proposed thresholds: th_h, th_l, th_s = (160, 255), (50, 160), (0, 255)
-    # Let's use these for apply_hls_thresholds as it expects it.
-    # The blog describes: H(노란색), L(조명), S(흰색) -> H for yellow, L for illumination, S for white.
-    # H (노란색): 15 ~ 35 (yellow range)
-    # L (조명): 30 ~ 200 (general brightness)
-    # S (흰색): 100 ~ 255 (high saturation for white under various light)
-    # The formula given in the prompt for apply_hls_thresholds is:
-    # combined_binary[((s_binary == 255) & (l_binary == 0)) | ((s_binary == 0) & (h_binary == 255) & (l_binary == 255))] = 255
-    # This specific combination logic from the blog is what `apply_hls_thresholds` implements.
-    # So, the thresholds passed to it should be the ones the blog intended for that formula.
-    # Blog's values: H(160,255), L(50,160), S(0,255) -> These are passed.
-    blog_th_h, blog_th_l, blog_th_s = (160, 255), (50, 160), (0, 255)
-    hls_binary = apply_hls_thresholds(hls_roi_image, blog_th_h, blog_th_l, blog_th_s)
-
-    # (Future/Alternative - Sobel)
-    # gray_roi_image = cv2.cvtColor(roi_image, cv2.COLOR_BGR2GRAY)
-    # l_channel_roi = hls_roi_image[:,:,1]
-    # sobel_x_binary = apply_sobel_threshold(l_channel_roi, orient='x', ksize=3, thresh=(25, 100))
-    # combined_output = cv2.bitwise_or(hls_binary, sobel_x_binary)
-    # return combined_output
-    
-    return hls_binary
-
-
-def img_callback(data):
-    global image
-    image = bridge.imgmsg_to_cv2(data, "bgr8")
-
-def drive(angle, speed):
-    msg = XycarMotor()
-    msg.angle = float(angle)
-    msg.speed = float(speed)
-    motor_pub.publish(msg)
-
-def start():
-    global motor_pub, frame_count, prev_angle, white_lost_count, prev_left_fit_coeffs, prev_right_fit_coeffs, YM_PER_PIX # image is already global
-
-    rospy.init_node('xycar_lane_keeper') # Or a new name like 'xycar_lane_keeper'
-    motor_pub = rospy.Publisher('/xycar_motor', XycarMotor, queue_size=1)
-    rospy.Subscriber('/usb_cam/image_raw', Image, img_callback)
-    
-    rospy.loginfo("Waiting for image topics...")
-    rospy.wait_for_message("/usb_cam/image_raw", Image) # Wait until the first image is received
-    rospy.loginfo("Image received. Starting advanced lane keeping node.")
-    
-    # Original code had rospy.sleep(1.0) here, wait_for_message is more robust
-
-    print("▶▶▶ Advanced Lane Detection Mode Start") # Updated print message
-
+def ros_main_loop():
+    global current_image_cv,motor_control_publisher,previous_left_polynomial_fit,previous_right_polynomial_fit, \
+           last_time_for_derivative_calc, prev_vehicle_offset_m_for_D, accumulated_integral_offset_meters
+    rospy.init_node('advanced_lane_keeping_controller')
+    motor_control_publisher = rospy.Publisher('/xycar_motor',XycarMotor,queue_size=1)
+    rospy.Subscriber('/usb_cam/image_raw',Image,ros_image_callback,queue_size=1)
+    rospy.loginfo("Waiting for initial image message...")
+    while current_image_cv is None and not rospy.is_shutdown():
+        rospy.loginfo_throttle(1.0,"Still no image received...")
+        time.sleep(0.1)
+    rospy.loginfo("Initial image received. Starting Advanced Lane Keeping Controller.")
+    print("▶▶▶ Advanced Lane Detection & Control Algorithm Initialized")
+    last_time_for_derivative_calc = rospy.get_time()
+    prev_vehicle_offset_m_for_D = 0.0
+    accumulated_integral_offset_meters = 0.0
+    loop_rate = rospy.Rate(20)
     while not rospy.is_shutdown():
-        if image is None:
-            rospy.logwarn_throttle(1.0, "Image is None, skipping frame.")
-            time.sleep(0.1) # Prevent busy-looping if image is consistently None
-            continue
-
-        # Resize image (as per blog example)
-        original_height, original_width = image.shape[:2]
-        proc_image = cv2.resize(image, None, fx=0.5, fy=0.5, interpolation=cv2.INTER_AREA)
-        current_height, current_width = proc_image.shape[:2] # New height and width after resize
-        
-        display_image = proc_image.copy() # Image for drawing visualizations on
-
-        # Conceptual ROI params for preprocessing functions (based on resized image dimensions)
-        # These will be passed to and used by the actual preprocessing functions later.
-        # Example: roi_y_start = int(current_height * 0.6)
-        # Example: roi_y_end = int(current_height * 0.95)
-
-        # Define ROI for preprocessing (using resized image dimensions)
-        # These numbers are from the blog, relative to the *resized* image (e.g., 360p).
-        roi_y_start = 220 
-        roi_y_start = min(roi_y_start, current_height - 20) # Safeguard: ensure at least 20px height for ROI
-        roi_y_end = current_height - 12
-        
-        if roi_y_end <= roi_y_start: # Ensure y_end > y_start
-            roi_y_start = int(current_height * 0.5) # Fallback: upper half
-            roi_y_end = current_height -1 # Fallback: near bottom
-            if roi_y_end <= roi_y_start: # If still problematic (very small image)
-                 roi_y_start = 0
-                 roi_y_end = current_height
-
-
-        roi_x_start = 0
-        roi_x_end = current_width
-        roi_coords_for_preprocess = (roi_y_start, roi_y_end, roi_x_start, roi_x_end)
-
-        # --- STAGE 1: Image Preprocessing ---
-        combined_binary_image = preprocess_pipeline(proc_image, roi_coords_for_preprocess)
-
-
-        # --- STAGE 2: Perspective Transform ---
-        M = None # Initialize to None
-        Minv = None # Initialize to None
-
-        if combined_binary_image is None or combined_binary_image.size == 0:
-            rospy.logwarn_throttle(1.0, "Combined binary image is empty, skipping warp.")
-            # Create a dummy black warped_image if preprocessing failed
-            # Use last known good dimensions or a default if not available
-            # For now, using a fixed default size for dummy image
-            warped_image_width_default = 320
-            warped_image_height_default = 400
-            warped_image = np.zeros((warped_image_height_default, warped_image_width_default), dtype=np.uint8)
-        else:
-            roi_h, roi_w = combined_binary_image.shape[:2]
-
-            # Source points for perspective transform (relative to combined_binary_image)
-            # Using blog's second set, scaled by roi_w relative to a 640px reference.
-            # Order: Bottom-Left, Bottom-Right, Top-Right, Top-Left
-            ref_width_for_blog_pts = 640.0 
-            scale_x = roi_w / ref_width_for_blog_pts
-            
-            src_pts = np.float32([
-                [100 * scale_x, roi_h],      # Bottom-left
-                [450 * scale_x, roi_h],      # Bottom-right
-                [310 * scale_x, 40],         # Top-right (Y=40 from top of ROI)
-                [270 * scale_x, 40]          # Top-left (Y=40 from top of ROI)
-            ])
-
-            # Destination points and size for the warped image
-            warped_image_width = 320
-            warped_image_height = 400 # This is H_warped_px for YM_PER_PIX calculation
-            dsize_warp = (warped_image_width, warped_image_height)
-            
-            # Update global YM_PER_PIX based on the actual warped image height used
-            # Assuming the vertical span of the bird's-eye view covers approx 30 meters.
-            YM_PER_PIX = 30.0 / warped_image_height
-
-
-            dst_pts = np.float32([
-                [0, warped_image_height],                  # Bottom-left
-                [warped_image_width, warped_image_height], # Bottom-right
-                [warped_image_width, 0],                   # Top-right
-                [0, 0]                                     # Top-left
-            ])
-
-            warped_image, M, Minv = warp_image(combined_binary_image, src_pts, dst_pts, dsize_warp)
-
-        # --- STAGE 3: Lane Pixel Identification ---
-        nwindows = 10 
-        margin = 80   
-        minpix = 40   
-        search_margin_around_poly = 80
-        current_lane_finding_viz_img = None # To store the visualization image from the chosen method
-
-        if prev_left_fit_coeffs is not None or prev_right_fit_coeffs is not None:
-            # rospy.loginfo("Attempting search around polynomial.")
-            left_x, left_y, right_x, right_y, poly_search_viz_img = \
-                search_around_poly(warped_image, prev_left_fit_coeffs, prev_right_fit_coeffs, margin=search_margin_around_poly)
-            
-            if (len(left_x) < minpix or len(right_x) < minpix):
-                # rospy.loginfo("Search around poly failed or found too few points, falling back to sliding window.")
-                if np.any(warped_image):
-                    left_x, left_y, right_x, right_y, sliding_window_viz_img = \
-                        find_lane_pixels_sliding_window(warped_image, nwindows=nwindows, margin=margin, minpix=minpix)
-                    current_lane_finding_viz_img = sliding_window_viz_img 
-                else:
-                    left_x, left_y, right_x, right_y = np.array([]), np.array([]), np.array([]), np.array([])
-                    current_lane_finding_viz_img = np.dstack((warped_image, warped_image, warped_image)) if warped_image.ndim == 2 else warped_image.copy()
-                    if np.max(warped_image) == 1 and warped_image.ndim == 2 : current_lane_finding_viz_img = current_lane_finding_viz_img * 255
-                    current_lane_finding_viz_img = current_lane_finding_viz_img.astype(np.uint8)
-            else:
-                # rospy.loginfo("Search around poly successful.")
-                current_lane_finding_viz_img = poly_search_viz_img
-        else: 
-            # rospy.loginfo("No previous fit, using sliding window.")
-            if np.any(warped_image):
-                left_x, left_y, right_x, right_y, sliding_window_viz_img = \
-                    find_lane_pixels_sliding_window(warped_image, nwindows=nwindows, margin=margin, minpix=minpix)
-                current_lane_finding_viz_img = sliding_window_viz_img
-            else:
-                left_x, left_y, right_x, right_y = np.array([]), np.array([]), np.array([]), np.array([])
-                current_lane_finding_viz_img = np.dstack((warped_image, warped_image, warped_image)) if warped_image.ndim == 2 else warped_image.copy()
-                if np.max(warped_image) == 1 and warped_image.ndim == 2 : current_lane_finding_viz_img = current_lane_finding_viz_img * 255
-                current_lane_finding_viz_img = current_lane_finding_viz_img.astype(np.uint8)
-
-        
-        # --- STAGE 4: Polynomial Fitting ---
-        current_warped_height = warped_image.shape[0] if warped_image is not None and hasattr(warped_image, 'shape') and warped_image.ndim == 2 else 0
-        
-        left_fit_coeffs, right_fit_coeffs = None, None
-        left_fitx_plot, right_fitx_plot, ploty_generated = np.array([]), np.array([]), np.array([])
-
-        if current_warped_height > 0 :
-            left_fit_coeffs, right_fit_coeffs, left_fitx_plot, right_fitx_plot, ploty_generated = \
-                fit_polynomial(left_x, left_y, right_x, right_y, current_warped_height)
-
-        # Update previous fits if current fitting is successful
-        if left_fit_coeffs is not None:
-            prev_left_fit_coeffs = left_fit_coeffs
-        # else: prev_left_fit_coeffs = None # Optional: reset if current fit fails
-
-        if right_fit_coeffs is not None:
-            prev_right_fit_coeffs = right_fit_coeffs
-        # else: prev_right_fit_coeffs = None # Optional: reset if current fit fails
-
-
-        # Temporary visualization of fitted polynomials on current_lane_finding_viz_img
-        if current_lane_finding_viz_img is not None and current_lane_finding_viz_img.size > 0:
-            if left_fit_coeffs is not None and left_fitx_plot.size > 0 and ploty_generated.size > 0:
-                pts_left = np.array([np.transpose(np.vstack([left_fitx_plot, ploty_generated]))])
-                cv2.polylines(current_lane_finding_viz_img, np.int_([pts_left]), isClosed=False, color=(255,255,0), thickness=2) # Cyan
-            
-            if right_fit_coeffs is not None and right_fitx_plot.size > 0 and ploty_generated.size > 0:
-                pts_right = np.array([np.transpose(np.vstack([right_fitx_plot, ploty_generated]))])
-                cv2.polylines(current_lane_finding_viz_img, np.int_([pts_right]), isClosed=False, color=(0,255,255), thickness=2) # Yellow
-        
-        
-        # --- STAGE 5: Curvature & Offset Calculation ---
-        left_curvature_m, right_curvature_m = float('inf'), float('inf')
-        vehicle_offset_m = 0.0
-        # Default xm_per_pix, assuming warped_image_width (e.g. 320px) corresponds to standard lane width
-        # This will be dynamically updated if possible
-        XM_PER_PIX_DEFAULT = STANDARD_LANE_WIDTH_M / warped_image_width 
-        calculated_xm_per_pix = XM_PER_PIX_DEFAULT
-
-        if ploty_generated.size > 0 and left_fitx_plot.size > 0 and right_fitx_plot.size > 0 and \
-           left_fit_coeffs is not None and right_fit_coeffs is not None and \
-           warped_image is not None and warped_image.shape[0] > 0 and warped_image.shape[1] > 0:
-            
-            bottom_left_x_px = left_fitx_plot[-1]
-            bottom_right_x_px = right_fitx_plot[-1]
-            
-            lane_width_at_bottom_px = bottom_right_x_px - bottom_left_x_px
-            if lane_width_at_bottom_px > 10: # Avoid division by zero or too small width
-                calculated_xm_per_pix = STANDARD_LANE_WIDTH_M / lane_width_at_bottom_px
-            # else: use XM_PER_PIX_DEFAULT already set
-
-            left_curvature_m, right_curvature_m = measure_curvature_real(
-                ploty_generated, left_fit_coeffs, right_fit_coeffs, 
-                current_warped_height, calculated_xm_per_pix
-            )
-
-            vehicle_offset_m = calculate_vehicle_offset(
-                warped_image.shape[1], bottom_left_x_px, bottom_right_x_px, 
-                calculated_xm_per_pix
-            )
-            
-            rospy.loginfo(f"L.Curv: {left_curvature_m:.0f}m, R.Curv: {right_curvature_m:.0f}m, Offset: {vehicle_offset_m:.2f}m, XMPX: {calculated_xm_per_pix:.4f}")
-        else:
-            rospy.logwarn("Skipping curvature/offset calculation due to missing fits or invalid data.")
-
-        
-        # --- STAGE 6: Visualization ---
-        final_display_image = None # Initialize
-        if 'Minv' in locals() and Minv is not None: # Minv is from Stage 2
-            final_display_image = draw_lane_and_info(
-                display_image,       # Resized original BGR image
-                warped_image.shape,  # Pass shape of binary_warped_img
-                Minv,
-                left_fitx_plot,      # From Stage 4
-                right_fitx_plot,     # From Stage 4
-                ploty_generated,     # From Stage 4
-                left_curvature_m,    # From Stage 5
-                right_curvature_m,   # From Stage 5
-                vehicle_offset_m     # From Stage 5
-            )
-        else: # Fallback if Minv is not available
-            final_display_image = display_image.copy()
-            # Draw default/error text if Minv was not available
-            cv2.putText(final_display_image, f"L.Curv: {left_curvature_m:.0f}m R.Curv: {right_curvature_m:.0f}m", 
-                        (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA) # Red text
-            cv2.putText(final_display_image, f"Offset: {vehicle_offset_m:.2f}m (Warp Failed)", 
-                        (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,0,255), 2, cv2.LINE_AA)
-
-
-        # --- STAGE 7: Steering and Speed Calculation (To be implemented) ---
-        current_angle = 0.0  # Placeholder
-        current_speed = 30.0 # Placeholder speed
-
-        # Apply steering smoothing (kept from previous version)
-        max_delta = 3.0
-        if abs(current_angle - prev_angle) > max_delta:
-            current_angle = prev_angle + np.sign(current_angle - prev_angle) * max_delta
-        prev_angle = current_angle
-
-        # Update the main log info, potentially including curvature/offset later
-        rospy.loginfo(f"[CONTROL] Angle: {current_angle:.2f}, Speed: {current_speed:.2f}")
-
-
-        cv2.imshow("Original Resized", display_image) # Show the resized image
-        cv2.imshow("Processed Binary", combined_binary_image) 
-        cv2.imshow("Warped Image", warped_image) 
-        cv2.imshow("Lane Search Visualization", current_lane_finding_viz_img) # Updated window name
-        cv2.imshow("Final Lane Detection", final_display_image) 
-        cv2.waitKey(1)
-
-        drive(current_angle, current_speed)
-        time.sleep(0.02)
-
+        if current_image_cv is None:
+            loop_rate.sleep(); continue
+        local_image_copy = current_image_cv.copy()
+        final_angle,final_speed,viz_final,viz_mask,viz_warped,viz_search,dbg_info = main_image_processing_pipeline(local_image_copy)
+        publish_motor_commands(final_angle,final_speed)
+        log_output_str = (f"Off:{dbg_info['vehicle_offset_m']:.2f}m, HeadErr:{np.degrees(dbg_info.get('heading_error_rad',0)):.1f}d, "
+                   f"RawSteer:{np.degrees(dbg_info.get('target_steering_angle_rad',0)):.1f}d, FinalSteer:{final_angle:.1f}d, "
+                   f"SpeedCrv:{dbg_info.get('speed_based_on_curvature',0):.0f}, SpeedAng:{dbg_info.get('speed_based_on_angle',0):.0f}, FinalSpeed:{final_speed:.0f} | "
+                   f"P:{dbg_info.get('pid_p_offset',0):.1f},I:{dbg_info.get('pid_i_offset',0):.1f},D:{dbg_info.get('pid_d_offset',0):.1f},H:{dbg_info.get('pid_p_heading',0):.1f},FF:{dbg_info.get('ff_curvature',0):.1f}")
+        rospy.loginfo(log_output_str)
+        cv2.imshow("Final Lane Visualization",viz_final)
+        cv2.imshow("Combined Binary Mask (from ROI)",viz_mask)
+        cv2.imshow("Warped Binary Mask",viz_warped)
+        cv2.imshow("Lane Pixel Search Detail",viz_search)
+        if cv2.waitKey(1)&0xFF == ord('q'):
+            rospy.loginfo("Shutdown key (q) pressed. Exiting.")
+            break
+        loop_rate.sleep()
 if __name__ == '__main__':
-    try:
-        start()
-    except rospy.ROSInterruptException:
-        pass
+    try: ros_main_loop()
+    except rospy.ROSInterruptException: rospy.loginfo("ROSInterruptException caught during shutdown. Node exiting.")
+    except Exception as e: rospy.logerr(f"Unhandled critical exception in main: {e}")
     finally:
-        # Cleanup OpenCV windows on exit
         cv2.destroyAllWindows()
+        rospy.loginfo("OpenCV windows closed. Xycar controller node has shut down.")
