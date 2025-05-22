@@ -19,12 +19,19 @@ previous_left_fit = None
 previous_right_fit = None
 prev_vehicle_offset_m_for_D = 0.0 # For D term of PID
 last_time_for_D = 0.0             # For D term of PID
+integral_vehicle_offset_m = 0.0   # For I term of PID
 
-# PID and Feed-Forward Gains (NEEDS CAREFUL TUNING)
+# =====================================================================================
+# PID and Feed-Forward Gains (NEEDS EXTENSIVE TUNING!)
+# These are initial placeholder values and WILL require significant tuning 
+# based on the specific vehicle dynamics (e.g., Xycar in Unity simulator or real hardware) 
+# and the characteristics of the track / environment.
+# =====================================================================================
 KP_OFFSET = 30.0      # Proportional gain for vehicle offset (center_diff)
+KI_OFFSET = 2.0       # Integral gain for vehicle offset
 KD_OFFSET = 10.0      # Derivative gain for vehicle offset
-KP_HEADING = 25.0     # Proportional gain for heading error
-K_FF_CURVATURE = 0.8  # Feed-forward gain for lane curvature (signed_curvature_factor)
+KP_HEADING = 25.0     # Proportional gain for heading error (e_psi)
+K_FF_CURVATURE = 0.8  # Feed-forward gain for lane curvature (based on Am of centerline)
 
 
 # Constants for image processing and lane detection
@@ -191,11 +198,11 @@ def calculate_curvature_offset(left_fitx, right_fitx, ploty, warped_dims):
     return left_curverad,right_curverad,offset_m
 
 def visualize_lanes(original_img, warped_binary_shape, inv_matrix, left_fitx, right_fitx, ploty, 
-                    left_cur, right_cur, offset, final_steering_angle): # Added final_steering_angle
+                    left_cur, right_cur, offset, final_steering_angle):
     final_image = original_img.copy()
     font = cv2.FONT_HERSHEY_SIMPLEX
     font_scale = 0.6
-    font_color = (255,255,255) # White
+    font_color = (255,255,255)
     line_type = 2
     text_y_start = 30
     text_y_offset = 25
@@ -213,9 +220,9 @@ def visualize_lanes(original_img, warped_binary_shape, inv_matrix, left_fitx, ri
     pts_right_fill = np.array([np.flipud(np.transpose(np.vstack([right_fitx,ploty])))])
     pts = np.hstack((pts_left,pts_right_fill))
     cv2.fillPoly(color_warp,np.int_([pts]),(0,255,0))
-    cv2.polylines(color_warp,np.int_([pts_left]),isClosed=False,color=(255,0,0),thickness=10) # Blue for left
+    cv2.polylines(color_warp,np.int_([pts_left]),isClosed=False,color=(255,0,0),thickness=10)
     pts_right_line = np.array([np.transpose(np.vstack([right_fitx,ploty]))])
-    cv2.polylines(color_warp,np.int_([pts_right_line]),isClosed=False,color=(0,0,255),thickness=10) # Red for right
+    cv2.polylines(color_warp,np.int_([pts_right_line]),isClosed=False,color=(0,0,255),thickness=10)
     
     newwarp = cv2.warpPerspective(color_warp,inv_matrix,(original_img.shape[1],original_img.shape[0])) 
     final_image = cv2.addWeighted(final_image,1,newwarp,0.3,0)
@@ -228,7 +235,7 @@ def visualize_lanes(original_img, warped_binary_shape, inv_matrix, left_fitx, ri
     return final_image
 
 def process_image(image_input):
-    global previous_left_fit, previous_right_fit, prev_vehicle_offset_m_for_D, last_time_for_D
+    global previous_left_fit, previous_right_fit, prev_vehicle_offset_m_for_D, last_time_for_D, integral_vehicle_offset_m
     roi_bgr, resized_bgr_for_display = preprocess_image(image_input)
     combined_mask, yellow_mask, white_mask = create_masks(roi_bgr)
     warped_mask, pers_matrix, inv_pers_matrix = perspective_transform(combined_mask, SRC_POINTS_ROI_RATIOS, WARPED_WIDTH_RATIO, WARPED_HEIGHT_RATIO)
@@ -254,15 +261,22 @@ def process_image(image_input):
     
     current_time = rospy.get_time(); dt=0.0
     if last_time_for_D>0: dt = current_time-last_time_for_D
+    
     d_offset_dt = (center_diff-prev_vehicle_offset_m_for_D)/dt if dt>0.001 else 0.0
+    
+    if dt > 0: integral_vehicle_offset_m += center_diff * dt
+    max_integral_val = 0.5 
+    integral_vehicle_offset_m = np.clip(integral_vehicle_offset_m, -max_integral_val, max_integral_val)
+    i_offset_term = KI_OFFSET * integral_vehicle_offset_m
+
     prev_vehicle_offset_m_for_D,last_time_for_D = center_diff,current_time
     p_offset_term = KP_OFFSET*center_diff
     d_offset_term = KD_OFFSET*d_offset_dt
     p_heading_term = KP_HEADING*heading_error_rad
     ff_curvature_term = K_FF_CURVATURE*signed_curvature_factor
-    target_angle_rad = p_offset_term - p_heading_term - ff_curvature_term + d_offset_term
+    target_angle_rad = p_offset_term + i_offset_term + d_offset_term - p_heading_term - ff_curvature_term
     angle_deg = np.degrees(target_angle_rad)
-    angle = np.clip(angle_deg,-35.0,35.0)
+    angle = np.clip(angle_deg,-35.0,35.0) # Changed from -50,50
     
     avg_curvature = float('inf')
     if left_cur != float('inf') and right_cur != float('inf'): avg_curvature = (left_cur + right_cur) / 2.0
@@ -282,17 +296,17 @@ def process_image(image_input):
             
     speed = min(base_speed_for_curve,speed_due_to_angle)
 
-    final_visualization = resized_bgr_for_display # Default if visualization fails
+    final_visualization = resized_bgr_for_display 
     if left_fit is not None and right_fit is not None and inv_pers_matrix is not None:
          final_visualization = visualize_lanes(resized_bgr_for_display, warped_mask.shape, inv_pers_matrix, 
                                                left_fitx, right_fitx, ploty, 
-                                               left_cur, right_cur, center_diff, angle) # Pass angle here
-    else: # Fallback if Minv is not available or fits failed for drawing lane area
+                                               left_cur, right_cur, center_diff, angle)
+    else: 
         final_visualization = resized_bgr_for_display.copy()
         font = cv2.FONT_HERSHEY_SIMPLEX
         font_scale = 0.6; line_type = 2; text_y_start = 30; text_y_offset = 25
         cv2.putText(final_visualization, f"Curvature: {left_cur:.0f}m R:{right_cur:.0f}m (Warp/Fit Error)", 
-                    (10, text_y_start), font, font_scale, (0,0,255), line_type) # Red text
+                    (10, text_y_start), font, font_scale, (0,0,255), line_type)
         cv2.putText(final_visualization, f"Offset: {center_diff:.2f}m (Warp/Fit Error)", 
                     (10, text_y_start + text_y_offset), font, font_scale, (0,0,255), line_type)
         cv2.putText(final_visualization, f"Steer Angle: {angle:.1f} deg (Warp/Fit Error)", 
@@ -300,9 +314,9 @@ def process_image(image_input):
 
     debug_info = {"left_curvature":left_cur,"right_curvature":right_cur,"center_diff":center_diff,
                   "heading_error_rad":heading_error_rad,"signed_curvature_factor":signed_curvature_factor,
-                  "pid_p_offset":p_offset_term,"pid_d_offset":d_offset_term,"pid_p_heading":p_heading_term,
-                  "ff_curvature":ff_curvature_term,"target_angle_rad":target_angle_rad,"final_angle_deg":angle,
-                  "avg_curvature":avg_curvature, "base_speed_for_curve":base_speed_for_curve,
+                  "pid_p_offset":p_offset_term,"pid_d_offset":d_offset_term, "integral_offset_val": integral_vehicle_offset_m, "pid_i_offset": i_offset_term,
+                  "pid_p_heading":p_heading_term,"ff_curvature":ff_curvature_term,"target_angle_rad":target_angle_rad,
+                  "final_angle_deg":angle,"avg_curvature":avg_curvature, "base_speed_for_curve":base_speed_for_curve,
                   "speed_due_to_angle":speed_due_to_angle, "final_speed":speed}
     return angle,speed,final_visualization,combined_mask,warped_mask,lane_search_viz,debug_info
 
@@ -316,7 +330,7 @@ def drive_car(angle,speed):
         motor_publisher.publish(msg)
 
 def main_loop():
-    global current_image,motor_publisher,previous_left_fit,previous_right_fit,last_time_for_D,prev_vehicle_offset_m_for_D
+    global current_image,motor_publisher,previous_left_fit,previous_right_fit,last_time_for_D,prev_vehicle_offset_m_for_D, integral_vehicle_offset_m
     rospy.init_node('advanced_lane_keeping_node')
     motor_publisher = rospy.Publisher('/xycar_motor',XycarMotor,queue_size=1)
     rospy.Subscriber('/usb_cam/image_raw',Image,image_callback,queue_size=1)
@@ -328,6 +342,7 @@ def main_loop():
     print("▶▶▶ Advanced Lane Detection Algorithm Start")
     last_time_for_D = rospy.get_time()
     prev_vehicle_offset_m_for_D = 0.0
+    integral_vehicle_offset_m = 0.0 # Initialize integral term
     rate = rospy.Rate(20)
     while not rospy.is_shutdown():
         if current_image is None:
@@ -337,8 +352,8 @@ def main_loop():
         drive_car(angle,speed)
         log_msg = (f"Off:{debug_info['center_diff']:.2f}m, HeadErr:{np.degrees(debug_info.get('heading_error_rad',0)):.1f}d, "
                    f"RawSteer:{np.degrees(debug_info.get('target_angle_rad',0)):.1f}d, FinalSteer:{angle:.1f}d, "
-                   f"SpeedCrv:{debug_info.get('base_speed_for_curve',0):.0f}, SpeedAng:{debug_info.get('speed_due_to_angle',0):.0f}, FinalSpeed:{speed:.0f} "
-                   f"P:{debug_info.get('pid_p_offset',0):.1f},D:{debug_info.get('pid_d_offset',0):.1f},H:{debug_info.get('pid_p_heading',0):.1f},FF:{debug_info.get('ff_curvature',0):.1f}")
+                   f"SpeedCrv:{debug_info.get('base_speed_for_curve',0):.0f}, SpeedAng:{debug_info.get('speed_due_to_angle',0):.0f}, FinalSpeed:{speed:.0f} | "
+                   f"P:{debug_info.get('pid_p_offset',0):.1f},I:{debug_info.get('pid_i_offset',0):.1f},D:{debug_info.get('pid_d_offset',0):.1f},H:{debug_info.get('pid_p_heading',0):.1f},FF:{debug_info.get('ff_curvature',0):.1f}")
         rospy.loginfo(log_msg)
         cv2.imshow("Final Visualization",final_viz)
         cv2.imshow("Combined Binary Mask (ROI)",combined_mask_viz)

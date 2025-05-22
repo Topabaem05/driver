@@ -40,14 +40,14 @@ The system processes camera images to detect lane lines, calculate lane geometry
 
 7.  **Steering Control (PID + Feed-Forward in `process_image`):**
     *   Calculates the derivative of the vehicle offset (`d_offset_dt`).
-    *   **PID Terms:**
-        *   Proportional term based on `center_diff` (vehicle offset).
-        *   Derivative term based on `d_offset_dt`.
-        *   Proportional term based on `heading_error_rad`.
+    *   **PID Terms for Lateral Control:**
+        *   Proportional term based on `center_diff` (vehicle's lateral offset from lane center).
+        *   Integral term based on the accumulated `center_diff` to correct steady-state errors. (Includes anti-windup).
+        *   Derivative term based on the rate of change of `center_diff` (`d_offset_dt`) to dampen response and improve stability.
+        *   Proportional term based on `heading_error_rad` (angle between vehicle's path and lane's tangent).
     *   **Feed-Forward Term:**
-        *   Based on the `signed_curvature_factor` to proactively steer into curves.
-    *   The final steering angle is a sum of these terms, converted to degrees, and then clipped (e.g., to +/-35 degrees).
-    *   Steering angle is smoothed over time using `prev_angle` and `max_delta` in the main `start` loop.
+        *   Based on the `signed_curvature_factor` (Am coefficient from the centerline's meter-space polynomial) to proactively steer into curves.
+    *   The final steering angle is a sum of these terms, converted to degrees, then clipped (e.g., to +/-35 degrees) and smoothed.
 
 8.  **Speed Control (Curvature-Aware in `process_image`):**
     *   Determines a `base_speed_for_curve` based on the average lane curvature radius (slower for sharper curves).
@@ -107,3 +107,15 @@ The system processes camera images to detect lane lines, calculate lane geometry
 ### ROS Topics
 - **Subscribed:** `/usb_cam/image_raw` (`sensor_msgs/Image`)
 - **Published:** `/xycar_motor` (`xycar_msgs/XycarMotor`)
+
+### Key Parameters & Tuning
+
+The following gains for the PID and Feed-Forward controller are defined at the top of `sam_lane_keeping_xycar.py` and **require careful tuning** for optimal performance in your specific environment:
+
+- `KP_OFFSET`: Proportional gain for lateral offset. Controls how strongly the car reacts to being off-center.
+- `KI_OFFSET`: Integral gain for lateral offset. Helps eliminate steady-state errors (e.g., consistent drift to one side). (Includes anti-windup).
+- `KD_OFFSET`: Derivative gain for lateral offset. Dampens oscillations and smooths the response to changes in offset.
+- `KP_HEADING`: Proportional gain for heading error. Controls how strongly the car corrects its angle relative to the lane.
+- `K_FF_CURVATURE`: Feed-forward gain for lane curvature. Allows the car to anticipate turns based on detected road curvature.
+
+Tuning these values is an iterative process. It's often recommended to tune P gains first, then D, then I, and finally the FF gain. Other parameters like ROI ratios, color thresholds, and perspective transform points (`SRC_POINTS_ROI_RATIOS`) also significantly impact performance and may need adjustment.
